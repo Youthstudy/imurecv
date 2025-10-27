@@ -168,8 +168,8 @@ class BluetoothIMU:
     def _check_packet_loss(self, current_timestamp):
         """✅ 检测丢包（基于时间戳连续性）"""
         if self.last_timestamp is not None:
-            # 假设采样率为100Hz（每个包间隔0.01秒）
-            expected_interval = 0.0025  # 400Hz
+            # 假设采样率为200Hz（每个包间隔0.005秒）
+            expected_interval = 1/200  # 200Hz
             actual_interval = current_timestamp - self.last_timestamp
             
             # 如果间隔超过预期的1.5倍，认为可能丢包
