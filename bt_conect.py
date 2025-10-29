@@ -1,488 +1,512 @@
-import asyncio
-from bleak import BleakScanner, BleakClient
-from datetime import datetime 
+import bluetooth
 import struct
-from collections import deque
-import csv
-import os
 import time
+import threading
+from queue import Queue
+import csv
+from datetime import datetime
+from typing import Callable, Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 
 
-class BluetoothIMU:
-    def __init__(self, mac_address, path='imu.csv', save_data=False, data_len=41, buffer_size=1000, batch_size=10):
+
+# 协议常量定义
+START_FLAG = b'\x3A'  # 包头: 0x3A
+END_FLAG = b'\x0D\x0A'  # 包尾: 0x0D0A
+PACKET_SIZE = 47  # 数据包固定大小
+
+class IMUSensorData:
+    """IMU传感器数据类"""
+    def __init__(self, device_id: str, timestamp: float, 
+                 gyro: tuple, acc: tuple, mag: tuple,
+                 quat: tuple, lin_acc: tuple, 
+                 system_time: str):
+        self.device_id = device_id
+        self.timestamp = timestamp
+        self.gyro_x, self.gyro_y, self.gyro_z = gyro
+        self.acc_x, self.acc_y, self.acc_z = acc
+        self.mag_x, self.mag_y, self.mag_z = mag
+        self.quat_w, self.quat_x, self.quat_y, self.quat_z = quat
+        self.lin_acc_x, self.lin_acc_y, self.lin_acc_z = lin_acc
+        self.system_time = system_time
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式"""
+        return {
+            'device_id': self.device_id,
+            'system_time': self.system_time,
+            'timestamp': self.timestamp,
+            'gyro': (self.gyro_x, self.gyro_y, self.gyro_z),
+            'acc': (self.acc_x, self.acc_y, self.acc_z),
+            'mag': (self.mag_x, self.mag_y, self.mag_z),
+            'quat': (self.quat_w, self.quat_x, self.quat_y, self.quat_z),
+            'lin_acc': (self.lin_acc_x, self.lin_acc_y, self.lin_acc_z)
+        }
+    
+    def to_list(self) -> List:
+        """转换为列表格式（用于CSV写入）"""
+        return [
+            self.system_time, self.timestamp,
+            self.gyro_x, self.gyro_y, self.gyro_z,
+            self.acc_x, self.acc_y, self.acc_z,
+            self.mag_x, self.mag_y, self.mag_z,
+            self.quat_w, self.quat_x, self.quat_y, self.quat_z,
+            self.lin_acc_x, self.lin_acc_y, self.lin_acc_z
+        ]
+
+
+class IMUDevice:
+    """单个IMU设备类"""
+    def __init__(self, device_id: str, mac_address: str, 
+                 data_callback: Optional[Callable[[IMUSensorData], None]] = None,
+                 error_callback: Optional[Callable[[str, str], None]] = None,
+                 csv_file_path: Optional[str] = "./imu.csv"):
+        """
+        初始化IMU设备
+        
+        Args:
+            device_id: 设备唯一标识符
+            mac_address: 蓝牙MAC地址
+            data_callback: 数据回调函数，接收IMUSensorData对象
+            error_callback: 错误回调函数，接收(device_id, error_message)
+        """
+        self.device_id = device_id
         self.mac_address = mac_address
+        self.data_callback = data_callback
+        self.error_callback = error_callback
+        
         self.sock = None
-        self.running = False
-        self.START_FLAG = b'\x3A'  # 包头: 0x3A
-        self.END_FLAG = b'\x0D\x0A'  # 包尾: 0x0D0A (即 '\r')
-        self.csv_file_path = self.getUniqueFilename(path)
-        self.data_len = data_len
-        
-        # ✅ 优化：使用 deque 替代 asyncio.Queue（更快）
-        self.buffer = deque(maxlen=buffer_size)
-        self.buffer_lock = asyncio.Lock()
-        
-        self.saveflag = save_data
-        self.step = 0
-        self.raw_buffer = bytearray()
-        self.unpacked_data = []
-        
-        # ✅ 添加客户端对象和连接状态
-        self.client = None
+        self.buffer = []
+        self.stop_event = threading.Event()
+        self.receive_thread = None
         self.is_connected = False
-        
-        # ✅ 批量写入优化
-        self.batch_size = batch_size
-        self.write_buffer = []
-        self.csv_file = None
-        self.csv_writer = None
-        
-        # ✅ 统计信息
-        self.packet_count = 0
-        self.error_count = 0
-        self.last_timestamp = None
-        self.dropped_packets = 0
-        self.last_report_time = time.time()
-        self.packets_per_second = 0
-        self.total_received = 0
+        self._connection_lock = threading.Lock()
 
-    @staticmethod
-    async def scan_devices(timeout=5):
-        """扫描 BLE 设备"""
-        print(f"🔍 正在扫描 BLE 设备 ({timeout}s)...")
-        devices = await BleakScanner.discover(timeout=timeout)
-        if not devices:
-            print("❌ 没有发现设备")
-            return []
-        
-        print(f"\n找到 {len(devices)} 个设备:")
-        for i, d in enumerate(devices):
-            print(f"{i}: {d.name or '未知设备'} [{d.address}] RSSI: {d.rssi}")
-        return devices
+        self.csv_file_path = self._get_unique_filename(csv_file_path) if csv_file_path else None
+        if self.csv_file_path:
+            self._create_csv()
 
-    def process_data(self, sender, data):
-        """✅ 优化：直接添加到 deque"""
-        try:
-            self.buffer.append(data)
-            self.total_received += 1
-        except Exception as e:
-            print(f"⚠️ [{self.mac_address}] 数据入队失败:", e)
-            self.error_count += 1
+    def _create_csv(self):
+        """创建CSV文件并写入表头"""
+        with open(self.csv_file_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                "System_Time", "Timestamp",
+                "Gyro_X", "Gyro_Y", "Gyro_Z",
+                "Acc_X", "Acc_Y", "Acc_Z",
+                "Mag_X", "Mag_Y", "Mag_Z",
+                "Quat_W", "Quat_X", "Quat_Y", "Quat_Z",
+                "Linear_Acc_X", "Linear_Acc_Y", "Linear_Acc_Z"
+            ])
 
-    # ✅ 数据处理任务：持续从队列取数据、解析、打印/保存
-    async def data_handler(self):
-        print(f"🧩 [{self.mac_address}] 数据处理线程已启动")
+    def _get_unique_filename(self, path: str) -> str:
+        """生成唯一文件名"""
+        base, ext = os.path.splitext(path)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mac_suffix = self.mac_address.replace(':', '')[-6:]
+        return f"{base}_{mac_suffix}_{timestamp}{ext}"
+    
+    def connect(self, port: int = 1, timeout: float = 10.0) -> bool:
+        """
+        连接到IMU设备
         
-        # 如果需要保存，打开CSV文件
-        if self.saveflag:
-            self._open_csv_file()
-        
-        while self.is_connected:
+        Args:
+            port: RFCOMM端口号
+            timeout: 连接超时时间（秒）
+        """
+        with self._connection_lock:
+            if self.is_connected:
+                print(f"⚠ 设备 {self.device_id} 已经连接")
+                return True
+            
             try:
-                # ✅ 批量处理数据
-                batch = []
-                while len(self.buffer) > 0 and len(batch) < 20:
-                    try:
-                        batch.append(self.buffer.popleft())
-                    except IndexError:
-                        break
+                print(f"⏳ 正在连接设备 {self.device_id} ({self.mac_address})...")
+                self.sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
                 
-                if batch:
-                    for data in batch:
-                        await self.handle_packet(data)
-                else:
-                    # 没有数据时短暂休眠
-                    await asyncio.sleep(0.001)
+                # 设置超时
+                self.sock.settimeout(timeout)
+                self.sock.connect((self.mac_address, port))
                 
-                # ✅ 定期刷新CSV缓冲区
-                if self.saveflag and len(self.write_buffer) >= self.batch_size:
-                    self._flush_csv_buffer()
+                # 连接成功后，设置为非阻塞模式以便接收数据
+                self.sock.settimeout(1.0)
                 
-                # ✅ 定期报告统计
-                await self._report_statistics()
+                self.is_connected = True
+                print(f"✓ 设备 {self.device_id} ({self.mac_address}) 连接成功")
+                return True
                 
+            except bluetooth.BluetoothError as e:
+                error_msg = f"蓝牙连接失败: {e}"
+                print(f"✗ 设备 {self.device_id} {error_msg}")
+                if self.error_callback:
+                    self.error_callback(self.device_id, error_msg)
+                return False
             except Exception as e:
-                print(f"⚠️ [{self.mac_address}] 数据处理错误: {e}")
-                self.error_count += 1
+                error_msg = f"连接失败: {e}"
+                print(f"✗ 设备 {self.device_id} {error_msg}")
+                if self.error_callback:
+                    self.error_callback(self.device_id, error_msg)
+                return False
+    
+    def start_receiving(self):
+        """启动数据接收线程"""
+        if not self.is_connected:
+            print(f"✗ 设备 {self.device_id} 未连接，无法启动接收")
+            return
         
-        # 清理资源
-        if self.saveflag:
-            self._close_csv_file()
-        print(f"🛑 [{self.mac_address}] 数据处理线程已停止")
-
-    async def handle_packet(self, data):
-        self.raw_buffer.extend(data)
+        if self.receive_thread and self.receive_thread.is_alive():
+            print(f"⚠ 设备 {self.device_id} 接收线程已在运行")
+            return
         
-        while len(self.raw_buffer) >= self.data_len:
-            # 查找帧头
-            start_index = self.raw_buffer.find(self.START_FLAG)
-
-            if start_index == -1:
-                if len(self.raw_buffer) > 0:
-                    # print(f"❌ [{self.mac_address}] 未找到帧头 0x3A，丢弃数据")
-                    self.error_count += 1
-                self.raw_buffer.clear()
-                break
-            
-            # 如果帧头不在开始位置，丢弃之前的数据
-            if start_index > 0:
-                # print(f"⚠️ [{self.mac_address}] 丢弃帧头前的数据")
-                self.raw_buffer = self.raw_buffer[start_index:]
-                self.error_count += 1
-
-            # 查找帧尾（从帧头之后开始查找）
-            end_index = self.raw_buffer.find(self.END_FLAG, 1)
-
-            if end_index == -1:
-                # 如果缓冲区过大，可能是数据损坏
-                if len(self.raw_buffer) > 1024:
-                    # print(f"❌ [{self.mac_address}] 缓冲区溢出，清空数据")
-                    self.raw_buffer.clear()
-                    self.error_count += 1
-                break
-            
-            # 提取完整的数据包（包括帧头和帧尾）
-            packet_end = end_index + len(self.END_FLAG)
-            packet = bytes(self.raw_buffer[:packet_end])
-            
-            # 从缓冲区移除已处理的数据包
-            self.raw_buffer = self.raw_buffer[packet_end:]
-
-            # 验证数据包
-            if packet[0:1] == self.START_FLAG and packet[-2:] == self.END_FLAG:
-                # 解析数据包
-                self.unpacked_data = self.unpack_data(packet)
-                if self.unpacked_data:
-                    self.packet_count += 1
-                    
-                    # ✅ 检测丢包
-                    self._check_packet_loss(self.unpacked_data["timestamp"])
-                    
-                    if self.saveflag:
-                        # 添加到批量写入缓冲区
-                        self.write_buffer.append(self.unpacked_data)
-            else:
-                # print(f"❌ [{self.mac_address}] 数据包格式错误")
-                self.error_count += 1
-
-    def _check_packet_loss(self, current_timestamp):
-        """✅ 检测丢包（基于时间戳连续性）"""
-        if self.last_timestamp is not None:
-            # 假设采样率为200Hz（每个包间隔0.005秒）
-            expected_interval = 1/200  # 200Hz
-            actual_interval = current_timestamp - self.last_timestamp
-            
-            # 如果间隔超过预期的1.5倍，认为可能丢包
-            if actual_interval > expected_interval * 1.5:
-                missed = int(actual_interval / expected_interval) - 1
-                if missed > 0:
-                    self.dropped_packets += missed
-                    # print(f"⚠️ [{self.mac_address}] 检测到丢包 {missed} 个")
-        
-        self.last_timestamp = current_timestamp
-
-    def _open_csv_file(self):
-        """打开CSV文件"""
+        self.stop_event.clear()
+        self.receive_thread = threading.Thread(
+            target=self._receive_data,
+            name=f"IMU-{self.device_id}",
+            daemon=True
+        )
+        self.receive_thread.start()
+        print(f"✓ 设备 {self.device_id} 开始接收数据")
+    
+    def stop_receiving(self):
+        """停止数据接收"""
+        self.stop_event.set()
+        if self.receive_thread:
+            self.receive_thread.join(timeout=2)
+        print(f"✓ 设备 {self.device_id} 停止接收数据")
+    
+    def disconnect(self):
+        """断开连接"""
+        self.stop_receiving()
+        with self._connection_lock:
+            if self.sock:
+                try:
+                    self.sock.close()
+                    self.is_connected = False
+                    print(f"✓ 设备 {self.device_id} 断开连接")
+                except Exception as e:
+                    print(f"✗ 设备 {self.device_id} 断开连接时出错: {e}")
+            self.sock = None
+    
+    def _unpack_packet(self, packet: bytes) -> Optional[IMUSensorData]:
+        """解包数据"""
         try:
-            file_exists = os.path.isfile(self.csv_file_path)
-            self.csv_file = open(self.csv_file_path, mode='a', newline='', encoding='utf-8', buffering=8192)
-            self.csv_writer = csv.writer(self.csv_file)
+            data = packet[1:-4]
+            fmt = '<HHHIhhhhhhhhhhhhhhhh'
+            expected_size = struct.calcsize(fmt)
             
-            if not file_exists:
-                self.csv_writer.writerow([
-                    "Timestamp", "imuTimestamp", "Gyro_X (rad/s)", "Gyro_Y (rad/s)", "Gyro_Z (rad/s)",
-                    "Acc_X (g)", "Acc_Y (g)", "Acc_Z (g)",
-                    "Mag_X (μT)", "Mag_Y (μT)", "Mag_Z (μT)",
-                    "Euler_X", "Euler_Y", "Euler_Z",
-                    "Quaternion_W", "Quaternion_X", "Quaternion_Y", "Quaternion_Z",
-                    "Linear_Acc_X (g)", "Linear_Acc_Y (g)", "Linear_Acc_Z (g)"
-                ])
-        except Exception as e:
-            print(f"❌ [{self.mac_address}] 打开CSV文件失败: {e}")
+            if len(data) != expected_size:
+                return None
+            
+            values = struct.unpack(fmt, data)
+            timestamp = values[3] / 400.0
+            gyro = tuple(v * 1e-3 for v in values[4:7])
+            acc = tuple(v * 1e-3 for v in values[7:10])
+            mag = tuple(v * 1e-2 for v in values[10:13])
+            quat = tuple(v * 1e-4 for v in values[13:17])
+            lin_acc = tuple(v * 1e-3 for v in values[17:20])
+            system_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            
+            self.save_to_csv(IMUSensorData(
+                device_id=self.device_id,
+                timestamp=timestamp,
+                gyro=gyro,
+                acc=acc,
+                mag=mag,
+                quat=quat,
+                lin_acc=lin_acc,
+                system_time=system_time
+            ))
 
-    def _flush_csv_buffer(self):
-        """✅ 批量写入CSV"""
-        if not self.write_buffer or not self.csv_writer:
+            return IMUSensorData(
+                device_id=self.device_id,
+                timestamp=timestamp,
+                gyro=gyro,
+                acc=acc,
+                mag=mag,
+                quat=quat,
+                lin_acc=lin_acc,
+                system_time=system_time
+            )
+        except Exception as e:
+            error_msg = f"解包错误: {e}"
+            if self.error_callback:
+                self.error_callback(self.device_id, error_msg)
+            return None
+    
+    def save_to_csv(self, data: IMUSensorData):
+        """将数据保存到CSV文件"""
+        if not self.csv_file_path:
             return
         
         try:
-            for data in self.write_buffer:
-                t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                self.csv_writer.writerow([
-                    t,
-                    data["timestamp"],
-                    *data["gyro"],
-                    *data["acc"],
-                    *data["mag"],
-                    *data["euler"],
-                    *data["quaternion"],
-                    *data["linear_acceleration"],
-                ])
-            
-            self.csv_file.flush()
-            self.write_buffer.clear()
+            with open(self.csv_file_path, 'a', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(data.to_list())
         except Exception as e:
-            print(f"❌ [{self.mac_address}] 批量写入CSV失败: {e}")
+            error_msg = f"写入CSV失败: {e}"
+            if self.error_callback:
+                self.error_callback(self.device_id, error_msg)
 
-    def _close_csv_file(self):
-        """关闭CSV文件"""
-        if self.write_buffer:
-            self._flush_csv_buffer()
-        
-        if self.csv_file:
-            self.csv_file.close()
-            print(f"📝 [{self.mac_address}] CSV文件已保存: {self.csv_file_path}")
 
-    async def _report_statistics(self):
-        """✅ 定期报告统计信息"""
-        current_time = time.time()
-        if current_time - self.last_report_time >= 5.0:
-            elapsed = current_time - self.last_report_time
-            self.packets_per_second = self.packet_count / elapsed
-            
-            # 计算丢包率
-            total_expected = self.packet_count + self.dropped_packets
-            loss_rate = (self.dropped_packets / total_expected * 100) if total_expected > 0 else 0
-            
-            print(f"📊 [{self.mac_address}] 统计报告:")
-            print(f"   ├─ 接收速率: {self.packets_per_second:.1f} pps")
-            print(f"   ├─ 成功解析: {self.packet_count} 包")
-            print(f"   ├─ 丢包数量: {self.dropped_packets} 包")
-            print(f"   ├─ 丢包率: {loss_rate:.2f}%")
-            print(f"   ├─ 解析错误: {self.error_count} 次")
-            print(f"   ├─ 缓冲区使用: {len(self.buffer)}/{self.buffer.maxlen if hasattr(self.buffer, 'maxlen') else '∞'}")
-            print(f"   └─ 总接收: {self.total_received} 次\n")
-            
-            # 重置计数器
-            self.packet_count = 0
-            self.error_count = 0
-            self.dropped_packets = 0
-            self.last_report_time = current_time
-
-    def unpack_data(self, data):
-        try:
-            # 提取Sensor ID
-            sensor_id = struct.unpack('<H', data[1:3])[0]
-            # 提取指令号
-            command_id = struct.unpack('<H', data[3:5])[0]
-            # 提取数据长度
-            data_length = struct.unpack('<H', data[5:7])[0]
-            # 提取时间戳
-            timestamp_sec = struct.unpack('<I', data[7:11])[0] / 400
-            # 提取传感器数据
-            sensor_data = data[11:-4]
-
-            # ✅ 批量解包
-            gyro = struct.unpack('<3h', sensor_data[0:6])
-            acc = struct.unpack('<3h', sensor_data[6:12])
-            mag = struct.unpack('<3h', sensor_data[12:18])
-            quat = struct.unpack('<4h', sensor_data[18:26])
-            euler = struct.unpack('<3h', sensor_data[26:32])
-            lin_acc = struct.unpack('<3h', sensor_data[32:38])
-
-            return {
-                "sensor_id": sensor_id,
-                "command_id": command_id,
-                "data_length": data_length,
-                "gyro": tuple(x * 1e-3 for x in gyro),
-                "acc": tuple(x * 1e-3 for x in acc),
-                "mag": tuple(x * 1e-2 for x in mag),
-                "euler": tuple(x * 1e-4 for x in euler),
-                "quaternion": tuple(x * 1e-4 for x in quat),
-                "linear_acceleration": tuple(x * 1e-3 for x in lin_acc),
-                "timestamp": timestamp_sec
-            }
-        except Exception as e:
-            # print(f"❌ [{self.mac_address}] 解包失败: {e}")
-            return None
-
-    # ✅ 蓝牙连接与订阅
-    async def connect_and_read(self):
-        print(f"🔗 [{self.mac_address}] 尝试连接...")
-        
-        try:
-            self.client = BleakClient(self.mac_address, timeout=20.0)
-            await self.client.connect()
-            
-            if not self.client.is_connected:
-                print(f"❌ [{self.mac_address}] 连接失败")
-                return False
-            
-            self.is_connected = True
-            print(f"✅ [{self.mac_address}] 连接成功！")
-
-            # 寻找可通知特征
-            readable_chars = [
-                c for service in self.client.services
-                for c in service.characteristics
-                if "notify" in c.properties
-            ]
-            
-            if not readable_chars:
-                print(f"⚠️ [{self.mac_address}] 未发现可通知特征")
-                return False
-
-            char = readable_chars[0]
-            print(f"🔔 [{self.mac_address}] 订阅 {char.uuid} 的通知...")
-
-            await self.client.start_notify(char.uuid, self.process_data)
-
-            # ✅ 运行数据处理任务
-            await self.data_handler()
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ [{self.mac_address}] 连接错误: {e}")
-            self.is_connected = False
-            return False
-
-    async def disconnect(self):
-        """✅ 断开连接"""
-        if self.client and self.is_connected:
-            self.is_connected = False
+    def _receive_data(self):
+        """数据接收线程函数"""
+        while not self.stop_event.is_set():
             try:
-                await self.client.disconnect()
-                print(f"🔌 [{self.mac_address}] 已断开连接")
-            except Exception as e:
-                print(f"⚠️ [{self.mac_address}] 断开连接时出错: {e}")
+                data = self.sock.recv(1024)
+                if data:
+                    self.buffer.append(data)
                     
-    def getUniqueFilename(self, path):
-        base, ext = os.path.splitext(path)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        mac_suffix = self.mac_address.replace(':', '')[-6:]  # 取MAC地址后6位
-        return f"{base}_{mac_suffix}_{timestamp}{ext}"
+                    while len(self.buffer) > 0:
+                        combined_data = b''.join(self.buffer)
+                        
+                        if len(combined_data) >= PACKET_SIZE:
+                            # 验证包头和包尾
+                            if combined_data[:1] != START_FLAG:
+                                self.buffer.clear()
+                                break
+                            
+                            if combined_data[PACKET_SIZE-2:PACKET_SIZE] != END_FLAG:
+                                self.buffer.clear()
+                                break
+                            
+                            # 提取并解包数据
+                            packet = combined_data[:PACKET_SIZE]
+                            sensor_data = self._unpack_packet(packet)
+                            
+                            if sensor_data and self.data_callback:
+                                self.data_callback(sensor_data)
+                            
+                            # 处理剩余数据
+                            remaining_data = combined_data[PACKET_SIZE:]
+                            self.buffer.clear()
+                            if len(remaining_data) > 0:
+                                self.buffer.append(remaining_data)
+                        else:
+                            break
+                            
+            except bluetooth.BluetoothError as e:
+                if not self.stop_event.is_set():
+                    error_msg = f"蓝牙错误: {e}"
+                    if self.error_callback:
+                        self.error_callback(self.device_id, error_msg)
+                break
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    error_msg = f"接收线程错误: {e}"
+                    if self.error_callback:
+                        self.error_callback(self.device_id, error_msg)
+                break
 
 
-# ===== 多设备管理器 =====
 class MultiIMUManager:
+    """多IMU设备管理器"""
     def __init__(self):
-        self.imu_devices = []
-        self.tasks = []
+        """
+        初始化多IMU管理器
+        """
+        self.devices: Dict[str, IMUDevice] = {}
+
+        self.data_queue = Queue()
+        self.external_callbacks: List[Callable[[IMUSensorData], None]] = []
     
-    def add_device(self, mac_address, save_data=True, path=None, buffer_size=1000, batch_size=10):
+    def add_device(self, device_id: str, mac_address: str) -> bool:
         """添加IMU设备"""
-        if path is None:
-            path = f"imu.csv"
+        if device_id in self.devices:
+            print(f"✗ 设备 {device_id} 已存在")
+            return False
         
-        imu = BluetoothIMU(
+        device = IMUDevice(
+            device_id=device_id,
             mac_address=mac_address,
-            save_data=save_data,
-            path=path,
-            buffer_size=buffer_size,
-            batch_size=batch_size
+            error_callback=self._on_error
         )
-        self.imu_devices.append(imu)
-        print(f"➕ 添加设备: {mac_address}")
-        return imu
+        self.devices[device_id] = device
+        print(f"✓ 添加设备 {device_id} ({mac_address})")
+        return True
     
-    async def connect_all(self):
-        """并发连接所有设备"""
-        print(f"\n🚀 开始并发连接 {len(self.imu_devices)} 个设备...\n")
+    def register_callback(self, callback: Callable[[IMUSensorData], None]):
+        """
+        注册外部数据回调函数
         
-        # 创建所有连接任务
-        self.tasks = [
-            asyncio.create_task(imu.connect_and_read())
-            for imu in self.imu_devices
-        ]
+        Args:
+            callback: 回调函数，接收IMUSensorData对象
+        """
+        self.external_callbacks.append(callback)
+    
+    def connect_all(self, timeout: float = 10.0, parallel: bool = False) -> Dict[str, bool]:
+        """
+        连接所有设备
         
-        # 并发执行
+        Args:
+            timeout: 每个设备的连接超时时间（秒）
+            parallel: 是否并行连接（True=并行，False=串行）
+        
+        Returns:
+            Dict[device_id, success]: 每个设备的连接状态
+        """
+        results = {}
+        
+        if not self.devices:
+            print("⚠ 没有要连接的设备")
+            return results
+        
+        if parallel:
+            # 并行连接所有设备
+            print(f"\n🔗 开始并行连接 {len(self.devices)} 个设备...")
+            with ThreadPoolExecutor(max_workers=len(self.devices)) as executor:
+                future_to_device = {
+                    executor.submit(device.connect, 1, timeout): device_id
+                    for device_id, device in self.devices.items()
+                }
+                
+                for future in as_completed(future_to_device):
+                    device_id = future_to_device[future]
+                    try:
+                        results[device_id] = future.result()
+                    except Exception as e:
+                        print(f"✗ 设备 {device_id} 连接异常: {e}")
+                        results[device_id] = False
+        else:
+            # 串行连接设备
+            print(f"\n🔗 开始串行连接 {len(self.devices)} 个设备...")
+            port = 1
+            for device_id, device in self.devices.items():
+                results[device_id] = device.connect(port=port, timeout=timeout)
+                port += 1
+                time.sleep(0.5)  # 串行连接时稍微延迟
+        
+        # 统计连接结果
+        success_count = sum(1 for v in results.values() if v)
+        print(f"\n📊 连接完成: {success_count}/{len(results)} 个设备成功连接")
+        
+        return results
+    
+    def connect_device(self, device_id: str, timeout: float = 10.0) -> bool:
+        """
+        连接单个设备
+        
+        Args:
+            device_id: 设备ID
+            timeout: 连接超时时间（秒）
+        """
+        if device_id not in self.devices:
+            print(f"✗ 设备 {device_id} 不存在")
+            return False
+        
+        return self.devices[device_id].connect(timeout=timeout)
+    
+    def start_all(self):
+        """启动所有已连接设备的数据接收"""
+        started_count = 0
+        for device in self.devices.values():
+            if device.is_connected:
+                device.start_receiving()
+                started_count += 1
+        
+        print(f"\n▶ 已启动 {started_count}/{len(self.devices)} 个设备的数据接收")
+    
+    def start_device(self, device_id: str):
+        """启动单个设备的数据接收"""
+        if device_id in self.devices:
+            self.devices[device_id].start_receiving()
+    
+    def stop_all(self):
+        """停止所有设备的数据接收"""
+        for device in self.devices.values():
+            device.stop_receiving()
+        print(f"\n⏸ 已停止所有设备的数据接收")
+    
+    def disconnect_all(self):
+        """断开所有设备连接"""
+        for device in self.devices.values():
+            device.disconnect()
+        print(f"\n🔌 已断开所有设备连接")
+    
+    def get_connected_devices(self) -> List[str]:
+        """获取已连接的设备ID列表"""
+        return [device_id for device_id, device in self.devices.items() if device.is_connected]
+    
+    def get_device_status(self) -> Dict[str, Dict[str, Any]]:
+        """获取所有设备的状态"""
+        status = {}
+        for device_id, device in self.devices.items():
+            status[device_id] = {
+                'mac_address': device.mac_address,
+                'is_connected': device.is_connected,
+                'is_receiving': device.receive_thread.is_alive() if device.receive_thread else False
+            }
+        return status
+    
+    def get_data(self, timeout: Optional[float] = None) -> Optional[IMUSensorData]:
+        """
+        从队列获取数据（阻塞式）
+        
+        Args:
+            timeout: 超时时间（秒），None表示一直等待
+        
+        Returns:
+            IMUSensorData对象或None
+        """
         try:
-            await asyncio.gather(*self.tasks)
-        except KeyboardInterrupt:
-            print("⚠️ 收到中断信号，正在断开所有连接...")
-            await self.disconnect_all()
+            return self.data_queue.get(timeout=timeout)
+        except:
+            return None
     
-    async def disconnect_all(self):
-        """断开所有设备"""
-        print("\n🔌 断开所有设备...")
-        disconnect_tasks = [imu.disconnect() for imu in self.imu_devices]
-        await asyncio.gather(*disconnect_tasks, return_exceptions=True)
-        print("✅ 所有设备已断开")
-    
-    def print_status(self):
-        """打印所有设备状态"""
-        print("" + "="*60)
-        print("设备连接状态:")
-        print("="*60)
-        for imu in self.imu_devices:
-            status = "✅ 已连接" if imu.is_connected else "❌ 未连接"
-            print(f"{status} - {imu.mac_address}")
-        print("="*60 + "\n")
+    def _on_error(self, device_id: str, error_msg: str):
+        """错误处理回调"""
+        print(f"✗ [{device_id}] 错误: {error_msg}")
 
 
-
-# ===== 使用示例 =====
-async def main():
-    # 方式1: 手动指定多个设备地址
-    imu_addresses = [
-        "00:04:3E:6C:51:C1",
-        "00:04:3E:86:27:F0",
-        "00:04:3E:86:27:ED",
-    ]
-    
-    # 创建管理器
-    manager = MultiIMUManager()
-    
-    # 添加所有设备
-    for address in imu_addresses:
-        manager.add_device(
-            mac_address=address,
-            save_data=True,
-            path="imu.csv",
-            buffer_size=2000,   # ✅ 增大缓冲区
-            batch_size=20       # ✅ 批量写入
-        )
-    
-    manager.print_status()
-    
-    # 并发连接所有设备
-    try:
-        await manager.connect_all()
-    except KeyboardInterrupt:
-        print("⚠️ 程序被中断")
-    except Exception as e:
-        print(f"❌ 发生错误: {e}")
-    finally:
-        await manager.disconnect_all()
-
-
-# 方式2: 先扫描再连接
-async def scan_and_connect():
-    # 扫描设备
-    devices = await BluetoothIMU.scan_devices(timeout=10)
-    
-    if not devices:
-        print("未找到设备")
-        return
-    
-    # 创建管理器
-    manager = MultiIMUManager()
-    
-    # 选择要连接的设备
-    selected_devices = devices[:3] if len(devices) >= 3 else devices
-    
-    for device in selected_devices:
-        manager.add_device(
-            mac_address=device.address,
-            save_data=True,
-            buffer_size=2000,
-            batch_size=20
-        )
-    
-    manager.print_status()
-    
-    try:
-        await manager.connect_all()
-    except KeyboardInterrupt:
-        print("⚠️ 程序被中断")
-    finally:
-        await manager.disconnect_all()
-
-
+# 使用示例
 if __name__ == "__main__":
-    # 运行主程序
-    asyncio.run(main())
+    # 创建管理器
+    manager = MultiIMUManager()
     
-    # 或者先扫描
-    # asyncio.run(scan_and_connect())
+    # 添加多个IMU设备
+    manager.add_device("IMU_1", "00:04:3E:6C:51:C1")
+    manager.add_device("IMU_2", "00:04:3E:86:27:F0")  # 替换为实际MAC地址
+    manager.add_device("IMU_3", "00:04:3E:86:27:ED")  # 可以添加更多设备
+    
+    # 注册自定义回调函数（可选）
+    # def my_callback(data: IMUSensorData):
+    #     print(f"[{data.device_id}] Acc: ({data.acc_x:.3f}, {data.acc_y:.3f}, {data.acc_z:.3f})")
+    
+    # manager.register_callback(my_callback)
+    
+    # 并行连接所有设备（推荐，更快）
+    print("\n" + "="*50)
+    connection_results = manager.connect_all(timeout=10.0, parallel=True)
+    print("="*50)
+    
+    # 打印连接状态
+    print("\n设备状态:")
+    for device_id, status in manager.get_device_status().items():
+        status_icon = "✓" if status['is_connected'] else "✗"
+        print(f"  {status_icon} {device_id}: {status['mac_address']} - {'已连接' if status['is_connected'] else '未连接'}")
+    
+    # 只启动成功连接的设备
+    connected_devices = manager.get_connected_devices()
+    if connected_devices:
+        print(f"\n已连接的设备: {', '.join(connected_devices)}")
+        manager.start_all()
+        
+        # 主循环
+        try:
+            print("\n正在接收数据，按Ctrl+C停止...\n")
+            while True:
+                # 方式1: 从队列获取数据
+                data = manager.get_data(timeout=1.0)
+                # if data:
+                #     print(f"[队列] {data.device_id}: 时间戳={data.timestamp:.3f}")
+                
+                # 方式2: 数据会自动通过回调函数处理
+                time.sleep(0.01)
+                
+        except KeyboardInterrupt:
+            print("\n\n正在退出...")
+        finally:
+            manager.stop_all()
+            manager.disconnect_all()
+            print("程序已退出")
+    else:
+        print("\n⚠ 没有设备成功连接，程序退出")
+

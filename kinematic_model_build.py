@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Tuple, List
 from matplotlib import rcParams
 
+import bt_conect
+
 # 设置中文字体（SimHei 是黑体，Linux 可用 Noto Sans CJK）
 rcParams['font.sans-serif'] = ['SimHei']  # 或者 ['Microsoft YaHei']
 rcParams['axes.unicode_minus'] = False     # 解决负号 '-' 显示成方块的问题
