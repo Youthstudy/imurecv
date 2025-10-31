@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from typing import Tuple, List
 from matplotlib import rcParams
 
-import bt_conect
+# from bt_connect import IMUSensorData as IMUData
+import pandas as pd
 
 # 设置中文字体（SimHei 是黑体，Linux 可用 Noto Sans CJK）
 rcParams['font.sans-serif'] = ['SimHei']  # 或者 ['Microsoft YaHei']
@@ -18,7 +19,7 @@ class IMUData:
     accelerometer: np.ndarray  # 3D加速度 (m/s^2)
     gyroscope: np.ndarray      # 3D角速度 (rad/s)
     quaternion: np.ndarray     # 四元数 (w, x, y, z)
-    
+
 @dataclass
 class EncoderData:
     """编码器数据结构"""
@@ -510,16 +511,31 @@ class LowerLimbKinematicsDH:
                   f"{dh.d:<12.4f} {dh.theta:<12.4f}")
         print("-" * 70)
 
+def extract_imu(df, suffix, imu_name):
+    if suffix:
+        imu_cols = ['System_Time'] + [col for col in df.columns if col.endswith(suffix)]
+        imu_df = df[imu_cols].copy()
+        # 去掉后缀
+        imu_df.columns = ['System_Time'] + [col.replace(suffix, '') for col in imu_df.columns[1:]] 
+    else:
+        # 没有后缀的 IMU
+        imu_cols = ['System_Time'] + [col for col in df.columns if not any(col.endswith(s) for s in ['_x', '_y'])]
+        imu_df = df[imu_cols].copy()
+    imu_df['IMU'] = imu_name
+    return imu_df
+
+def df2imuData(imu_row):
+    """将 DataFrame 行转换为 IMUData 对象"""
+    accelerometer = np.array([imu_row['Acc_X'], imu_row['Acc_Y'], imu_row['Acc_Z']])
+    gyroscope = np.array([imu_row['Gyro_X'], imu_row['Gyro_Y'], imu_row['Gyro_Z']])
+    quaternion = np.array([imu_row['Quat_W'], imu_row['Quat_X'], imu_row['Quat_Y'], imu_row['Quat_Z']])
+    return IMUData(accelerometer=accelerometer, gyroscope=gyroscope, quaternion=quaternion)
 
 # 使用示例
 if __name__ == "__main__":
     # 创建运动学模型实例
     model = LowerLimbKinematicsDH(thigh_length=0.45, shank_length=0.43, hip_width=0.2)
     
-    # 模拟数据：行走步态
-    dt = 0.01  # 100Hz采样率
-    duration = 2.0  # 2秒
-    timestamps = np.arange(0, duration, dt)
     
     print("=" * 70)
     print("基于DH参数的下肢运动学模型")
@@ -527,71 +543,54 @@ if __name__ == "__main__":
     
     # 打印初始DH参数表
     model.print_dh_table(hip_angle=30, knee_angle=45, side='left')
-    
-    print("\n模拟步态数据...")
-    for i, t in enumerate(timestamps):
-        # 模拟IMU数据
-        pelvis_imu = IMUData(
-            accelerometer=np.array([0.1 * np.sin(2*np.pi*t), 9.81, 0]),
-            gyroscope=np.array([0, 0.1 * np.cos(2*np.pi*t), 0]),
-            quaternion=np.array([1, 0, 0.05*np.sin(2*np.pi*t), 0])
-        )
-        
-        # 左腿（超前相位）
+    df = pd.read_csv('merged.csv')  # 假设有一个包含IMU和编码器数据的CSV文件
+    # 提取三个 IMU
+    imu = [None, None, None]
+    imu[0] = extract_imu(df, '_x', 'IMU1')
+    imu[1] = extract_imu(df, '_y', 'IMU2')
+    imu[2] = extract_imu(df, '', 'IMU3')
+    t = 0
+    fs = 200
+    # 遍历每一行数据，更新模型
+    for index, row in df.iterrows():
+        # 提取IMU数据
+        pelvis_imu = df2imuData(imu[0].iloc[index])
+        left_thigh_imu = df2imuData(imu[1].iloc[index])
+        right_thigh_imu = df2imuData(imu[2].iloc[index])
+
         phase_left = 2 * np.pi * t
-        left_thigh_imu = IMUData(
-            accelerometer=np.array([0.5 * np.sin(phase_left), 9.81, 0]),
-            gyroscope=np.array([0, 0.3 * np.cos(phase_left), 0]),
-            quaternion=np.array([np.cos(0.3*np.sin(phase_left)), 
-                                0.3*np.sin(phase_left), 0, 
-                                np.sin(0.3*np.sin(phase_left))])
-        )
-        
-        # 右腿（滞后相位）
         phase_right = 2 * np.pi * t + np.pi/2
-        right_thigh_imu = IMUData(
-            accelerometer=np.array([0.5 * np.sin(phase_right), 0, 9.81]),
-            gyroscope=np.array([0, 0.3 * np.cos(phase_right), 0]),
-            quaternion=np.array([np.cos(0.3*np.sin(phase_right)), 
-                                0.3*np.sin(phase_right), 0,
-                                np.sin(0.3*np.sin(phase_right))])
-        )
-        
-        # 模拟膝关节编码器数据
+        t += 1/fs
+        # 模拟IMU数据
         left_knee_encoder = EncoderData(angle=0 + 35 * np.sin(phase_left))
         right_knee_encoder = EncoderData(angle=0 + 35 * np.sin(phase_right))
-        
         # 更新模型
-        result = model.update(
-            t, pelvis_imu, left_thigh_imu, right_thigh_imu,
-            left_knee_encoder, right_knee_encoder,
-            pelvis_position=np.array([0, 0, 1.0])  # 骨盆高度1米
+        model.update(
+            timestamp=t,
+            pelvis_imu=pelvis_imu,
+            left_thigh_imu=left_thigh_imu,
+            right_thigh_imu=right_thigh_imu,
+            left_knee_encoder=left_knee_encoder,
+            right_knee_encoder=right_knee_encoder
         )
-        
-        # 每0.5秒打印一次结果
-        if int(t * 100) % 50 == 0:
-            print(f"\n时间: {t:.2f}s")
-            print(f"左髋角度: {result['left_hip_angle']:.1f}°")
-            print(f"右髋角度: {result['right_hip_angle']:.1f}°")
-            print(f"左膝角度: {result['left_knee_angle']:.1f}°")
-            print(f"右膝角度: {result['right_knee_angle']:.1f}°")
+
     
     print("\n生成可视化图表...")
     
-    # 绘制关节角度
+    # # 绘制关节角度
     model.plot_joint_angles()
     
-    # 播放3D骨架动画
+    # # 播放3D骨架动画
     print("\n播放步态动画...")
     print("提示: 关闭窗口可继续显示静态图")
     
-    # 动画播放（每帧50ms，循环播放）
-    model.animate_skeleton(interval=50, repeat=True)
+    # # # 动画播放（每帧50ms，循环播放）
+    # model.animate_skeleton(interval=500, repeat=True)
     
     # 可选：保存为GIF动画（取消注释下面这行）
     # model.animate_skeleton(interval=50, repeat=True, save_path='gait_animation.gif')
     
-    # 绘制几个关键帧的静态图
+    # # 绘制几个关键帧的静态图
     # print("\n显示关键帧...")
     # num_frames = len(model.history['time'])
     # frame_indices = [0, num_frames//2, -1]

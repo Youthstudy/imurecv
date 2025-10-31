@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Callable, Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-
+from dataclasses import dataclass
 
 
 # 协议常量定义
@@ -16,11 +16,12 @@ START_FLAG = b'\x3A'  # 包头: 0x3A
 END_FLAG = b'\x0D\x0A'  # 包尾: 0x0D0A
 PACKET_SIZE = 47  # 数据包固定大小
 
+
 class IMUSensorData:
     """IMU传感器数据类"""
-    def __init__(self, device_id: str, timestamp: float, 
+    def __init__(self, device_id: str, timestamp: float,
                  gyro: tuple, acc: tuple, mag: tuple,
-                 quat: tuple, lin_acc: tuple, 
+                 quat: tuple, lin_acc: tuple,
                  system_time: str):
         self.device_id = device_id
         self.timestamp = timestamp
@@ -307,6 +308,24 @@ class MultiIMUManager:
 
         self.data_queue = Queue()
         self.external_callbacks: List[Callable[[IMUSensorData], None]] = []
+        self.latest_data: Dict[str, IMUSensorData] = {}
+
+    def get_latest_data(self, device_id: str) -> Dict[str, Optional[IMUSensorData]]:
+        """
+        获取指定设备的最新数据
+        
+        Args:
+            device_id: 设备ID
+        
+        Returns:
+            IMUSensorData对象或None
+        """
+        connected_ids = self.get_connected_devices()
+        return {
+            device_id: data 
+            for device_id, data in self.latest_data.items()
+            if device_id in connected_ids
+        }
     
     def add_device(self, device_id: str, mac_address: str) -> bool:
         """添加IMU设备"""
@@ -317,12 +336,22 @@ class MultiIMUManager:
         device = IMUDevice(
             device_id=device_id,
             mac_address=mac_address,
+            data_callback=self._on_data,
             error_callback=self._on_error
         )
         self.devices[device_id] = device
         print(f"✓ 添加设备 {device_id} ({mac_address})")
         return True
     
+    def _on_data(self, data: IMUSensorData):
+        """内部数据回调处理"""
+        # 放入队列
+        self.data_queue.put(data)
+        
+        # 调用外部注册的回调函数
+        for callback in self.external_callbacks:
+            callback(data)
+
     def register_callback(self, callback: Callable[[IMUSensorData], None]):
         """
         注册外部数据回调函数
