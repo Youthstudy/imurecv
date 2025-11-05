@@ -84,22 +84,34 @@ class IMUDevice:
         self.is_connected = False
         self._connection_lock = threading.Lock()
 
-        self.csv_file_path = self._get_unique_filename(csv_file_path) if csv_file_path else None
-        if self.csv_file_path:
-            self._create_csv()
+        self.csv_enabled = True  # 是否保存CSV
+        self.csv_file_path_base = csv_file_path  # 原始文件路径模板
+        self.csv_file_path = csv_file_path
+        self.csv_file = None
+        self.csv_writer = None
 
-    def _create_csv(self):
-        """创建CSV文件并写入表头"""
-        with open(self.csv_file_path, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                "System_Time", "Timestamp",
-                "Gyro_X", "Gyro_Y", "Gyro_Z",
-                "Acc_X", "Acc_Y", "Acc_Z",
-                "Mag_X", "Mag_Y", "Mag_Z",
-                "Quat_W", "Quat_X", "Quat_Y", "Quat_Z",
-                "Linear_Acc_X", "Linear_Acc_Y", "Linear_Acc_Z"
-            ])
+    def _open_new_csv(self):
+        if not self.csv_enabled:
+            return
+        self.csv_file_path = self._get_unique_filename(self.csv_file_path)
+        self.csv_file = open(self.csv_file_path, mode='w',newline='',encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            "System_Time", "Timestamp",
+            "Gyro_X", "Gyro_Y", "Gyro_Z",
+            "Acc_X", "Acc_Y", "Acc_Z",
+            "Mag_X", "Mag_Y", "Mag_Z",
+            "Quat_W", "Quat_X", "Quat_Y", "Quat_Z",
+            "Linear_Acc_X", "Linear_Acc_Y", "Linear_Acc_Z"
+        ])
+        print(f"🟢 已创建新的 CSV 文件: {os.path.basename(self.csv_file_path)}")
+
+    def _close_csv(self):
+        if self.csv_file:
+            self.csv_file.close()
+            print(f"🟡 已关闭 CSV 文件: {os.path.basename(self.csv_file_path)}")
+            self.csv_file = None
+            self.csv_writer = None
 
     def _get_unique_filename(self, path: str) -> str:
         """生成唯一文件名"""
@@ -108,6 +120,43 @@ class IMUDevice:
         mac_suffix = self.mac_address.replace(':', '')[-6:]
         return f"{base}_{mac_suffix}_{timestamp}{ext}"
     
+    def enable_csv(self, enable: bool):
+        """打开或关闭CSV保存"""
+        self.csv_enabled = enable
+        print(f"CSV 保存 {'已开启' if enable else '已关闭'}")
+
+    def save_to_csv(self, data):
+        """保存数据到CSV文件"""
+        if not self.csv_enabled or not self.csv_writer:
+            return
+        try:
+            self.csv_writer.writerow(data.to_list())
+        except Exception as e:
+            if self.error_callback:
+                self.error_callback(self.device_id, f"CSV写入错误: {e}")
+
+    def start_receiving(self):
+        """启动接收线程"""
+        if not self.is_connected:
+            print(f"✗ 设备 {self.device_id} 未连接，无法启动接收")
+            return
+        if self.receive_thread and self.receive_thread.is_alive():
+            print(f"⚠ 设备 {self.device_id} 接收线程已在运行")
+            return
+
+        # ✅ 每次启动都重新创建一个新CSV
+        self._open_new_csv()
+
+        self.stop_event.clear()
+        self.receive_thread = threading.Thread(
+            target=self._receive_data,
+            name=f"IMU-{self.device_id}",
+            daemon=True
+        )
+        self.receive_thread.start()
+        print(f"✓ 设备 {self.device_id} 开始接收数据")
+
+
     def connect(self, port: int = 1, timeout: float = 10.0) -> bool:
         """
         连接到IMU设备
@@ -149,24 +198,6 @@ class IMUDevice:
                     self.error_callback(self.device_id, error_msg)
                 return False
     
-    def start_receiving(self):
-        """启动数据接收线程"""
-        if not self.is_connected:
-            print(f"✗ 设备 {self.device_id} 未连接，无法启动接收")
-            return
-        
-        if self.receive_thread and self.receive_thread.is_alive():
-            print(f"⚠ 设备 {self.device_id} 接收线程已在运行")
-            return
-        
-        self.stop_event.clear()
-        self.receive_thread = threading.Thread(
-            target=self._receive_data,
-            name=f"IMU-{self.device_id}",
-            daemon=True
-        )
-        self.receive_thread.start()
-        print(f"✓ 设备 {self.device_id} 开始接收数据")
     
     def stop_receiving(self):
         """停止数据接收"""
@@ -233,19 +264,6 @@ class IMUDevice:
             if self.error_callback:
                 self.error_callback(self.device_id, error_msg)
             return None
-    
-    def save_to_csv(self, data: IMUSensorData):
-        """将数据保存到CSV文件"""
-        if not self.csv_file_path:
-            return
-        
-        try:
-            with open(self.csv_file_path, 'a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow(data.to_list())
-        except Exception as e:
-            error_msg = f"写入CSV失败: {e}"
-            if self.error_callback:
-                self.error_callback(self.device_id, error_msg)
 
 
     def _receive_data(self):

@@ -4,7 +4,7 @@ import time
 
 def main():
     manager = btc.MultiIMUManager()
-    receiver = m2p.SerialReceiver(port="COM5", baudrate=115200, output_csv="joint.csv")
+    receiver = m2p.SerialReceiver(port="COM19", baudrate=460800, output_csv="joint.csv")
     receiver.start()
     # 添加多个IMU设备
     manager.add_device("IMU_1", "00:04:3E:6C:51:C1")
