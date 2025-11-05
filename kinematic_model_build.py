@@ -57,7 +57,11 @@ class LowerLimbKinematicsDH:
             'left_knee_angle': [],
             'right_knee_angle': [],
             'left_joint_positions': [],
-            'right_joint_positions': []
+            'right_joint_positions': [],
+            'dh_params': {
+                'left': [],
+                'right': []
+            }
         }
         
     def dh_transform(self, dh: DHParameter) -> np.ndarray:
@@ -240,7 +244,11 @@ class LowerLimbKinematicsDH:
         self.history['right_knee_angle'].append(right_knee_encoder.angle)
         self.history['left_joint_positions'].append(left_positions)
         self.history['right_joint_positions'].append(right_positions)
-        
+        self.history['dh_params'] = {
+            'left': left_dh,
+            'right': right_dh
+        }
+
         return {
             'left_hip_angle': np.degrees(left_hip_angle),
             'right_hip_angle': np.degrees(right_hip_angle),
