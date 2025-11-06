@@ -86,14 +86,14 @@ class IMUDevice:
 
         self.csv_enabled = True  # 是否保存CSV
         self.csv_file_path_base = csv_file_path  # 原始文件路径模板
-        self.csv_file_path = csv_file_path
+        self.csv_file_path = None
         self.csv_file = None
         self.csv_writer = None
 
     def _open_new_csv(self):
         if not self.csv_enabled:
             return
-        self.csv_file_path = self._get_unique_filename(self.csv_file_path)
+        self.csv_file_path = self._get_unique_filename(self.csv_file_path_base)
         self.csv_file = open(self.csv_file_path, mode='w',newline='',encoding='utf-8')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
