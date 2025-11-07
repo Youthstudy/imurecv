@@ -40,7 +40,7 @@ class LowerLimbKinematicsDH:
             'left_joint_positions': [],
             'right_joint_positions': []
         }
-
+    
     def dh_transform(self, dh: DHParameter) -> np.ndarray:
         ct, st = np.cos(dh.theta), np.sin(dh.theta)
         ca, sa = np.cos(dh.alpha), np.sin(dh.alpha)

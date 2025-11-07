@@ -5,6 +5,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from dataclasses import dataclass
 from typing import Tuple, List
 from matplotlib import rcParams
+import math
 
 # from bt_connect import IMUSensorData as IMUData
 import pandas as pd
@@ -116,7 +117,7 @@ class LowerLimbKinematicsDH:
                 a=0,           # 无连杆长度
                 alpha=0,       # 无扭转
                 d=hip_offset,  # 髋关节横向偏移
-                theta=0        # 无旋转
+                theta=0       # 无旋转
             ),
             # 关节1: 髋关节（矢状面屈曲/伸展）
             DHParameter(
@@ -214,7 +215,6 @@ class LowerLimbKinematicsDH:
         if pelvis_position is None:
             pelvis_position = np.array([0.0, 0.0, 0.0])
         
-        # 构建骨盆位姿矩阵
         R_pelvis = self.quaternion_to_rotation_matrix(pelvis_imu.quaternion)
         pelvis_pose = np.eye(4)
         pelvis_pose[:3, :3] = R_pelvis
@@ -308,10 +308,10 @@ class LowerLimbKinematicsDH:
         ax.set_xlabel('X (米)', fontsize=12)
         ax.set_ylabel('Y (米)', fontsize=12)
         ax.set_zlabel('Z (米)', fontsize=12)
+        ax.set_zlim(max)
         ax.set_title(f'下肢骨架 (DH参数法) - 时间: {self.history["time"][frame_idx]:.2f}s', 
                      fontsize=14)
-        ax.legend()
-        
+
         # 设置相同的刻度范围
         all_x = left_x + right_x
         all_y = left_y + right_y
@@ -532,6 +532,19 @@ def extract_imu(df, suffix, imu_name):
     imu_df['IMU'] = imu_name
     return imu_df
 
+def extract_enc(df,suffix,joint_name):
+    if suffix:
+        enc_cols = [col for col in df.columns if col.endswith(suffix)]
+        enc_df = df[enc_cols].copy()
+        enc_df.columns = [col.replace(suffix, '') for col in enc_df.columns] 
+
+    enc_df['joint'] = joint_name
+    return enc_df
+
+def df2encode(enc_row):
+    angle = math.degrees(enc_row['ret0'])
+    return EncoderData(angle=angle)
+
 def df2imuData(imu_row):
     """将 DataFrame 行转换为 IMUData 对象"""
     accelerometer = np.array([imu_row['Acc_X'], imu_row['Acc_Y'], imu_row['Acc_Z']])
@@ -542,21 +555,24 @@ def df2imuData(imu_row):
 # 使用示例
 if __name__ == "__main__":
     # 创建运动学模型实例
-    model = LowerLimbKinematicsDH(thigh_length=0.45, shank_length=0.43, hip_width=0.2)
-    
+    model = LowerLimbKinematicsDH(thigh_length=0.50, shank_length=0.49, hip_width=0.37)
     
     print("=" * 70)
     print("基于DH参数的下肢运动学模型")
     print("=" * 70)
     
     # 打印初始DH参数表
-    model.print_dh_table(hip_angle=30, knee_angle=45, side='left')
-    df = pd.read_csv('merged.csv')  # 假设有一个包含IMU和编码器数据的CSV文件
+    model.print_dh_table(hip_angle=40, knee_angle=45, side='left')
+    df = pd.read_csv('F://3.biye//1_code//imurecv//data//merged//merged_20251106_183256.csv')  # 假设有一个包含IMU和编码器数据的CSV文件
     # 提取三个 IMU
     imu = [None, None, None]
-    imu[0] = extract_imu(df, '_x', 'IMU1')
-    imu[1] = extract_imu(df, '_y', 'IMU2')
-    imu[2] = extract_imu(df, '', 'IMU3')
+    imu[0] = extract_imu(df, '_1', 'IMU1')
+    imu[1] = extract_imu(df, '_3', 'IMU2')
+    imu[2] = extract_imu(df, '_2', 'IMU3')
+
+    joint = [None, None]
+    joint[0] = extract_enc(df,'_joint1','joint1')
+    joint[1] = extract_enc(df,'_joint2','joint2')
     t = 0
     fs = 200
     # 遍历每一行数据，更新模型
@@ -565,13 +581,10 @@ if __name__ == "__main__":
         pelvis_imu = df2imuData(imu[0].iloc[index])
         left_thigh_imu = df2imuData(imu[1].iloc[index])
         right_thigh_imu = df2imuData(imu[2].iloc[index])
-
-        phase_left = 2 * np.pi * t
-        phase_right = 2 * np.pi * t + np.pi/2
         t += 1/fs
         # 模拟IMU数据
-        left_knee_encoder = EncoderData(angle=0 + 35 * np.sin(phase_left))
-        right_knee_encoder = EncoderData(angle=0 + 35 * np.sin(phase_right))
+        left_knee_encoder = df2encode(joint[0].iloc[index])
+        right_knee_encoder = df2encode(joint[1].iloc[index])
         # 更新模型
         model.update(
             timestamp=t,
@@ -592,8 +605,8 @@ if __name__ == "__main__":
     print("\n播放步态动画...")
     print("提示: 关闭窗口可继续显示静态图")
     
-    # # # 动画播放（每帧50ms，循环播放）
-    # model.animate_skeleton(interval=500, repeat=True)
+    # # 动画播放（每帧50ms，循环播放）
+    model.animate_skeleton(interval=0.0, repeat=True)
     
     # 可选：保存为GIF动画（取消注释下面这行）
     # model.animate_skeleton(interval=50, repeat=True, save_path='gait_animation.gif')
