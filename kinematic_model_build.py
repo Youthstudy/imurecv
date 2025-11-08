@@ -253,7 +253,7 @@ class LowerLimbKinematicsDH:
         ax.legend(); ax.grid(True)
         plt.title(f'骨架 (帧 {frame_idx})'); plt.show()
 
-    def animate_skeleton(self, interval: int = 20, repeat=True, save_path: str = None):
+    def animate_skeleton(self, interval: int = 20, step: int = 5, repeat=True, save_path: str = None):
         """
         播放动画
         - interval: 毫秒 (务必为正整数)
@@ -317,8 +317,8 @@ class LowerLimbKinematicsDH:
                     joint_texts[ti].set_position((rx[i], ry[i])); joint_texts[ti].set_3d_properties(rz[i])
                     joint_texts[ti].set_text(f'R-{name}'); ti += 1
             return [left_line, right_line, pelvis_line, time_text] + joint_texts
-
-        anim = FuncAnimation(fig, update, frames=len(self.history['time']), init_func=init,
+        
+        anim = FuncAnimation(fig, update, frames=range(0, len(self.history['time']), step), init_func=init,
                              interval=interval, blit=False, repeat=repeat)
 
         if save_path:
