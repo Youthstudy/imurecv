@@ -1,198 +1,143 @@
+# kinematic_model_build_fixed.py
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from dataclasses import dataclass
-from typing import Tuple, List
+from typing import List
 from matplotlib import rcParams
 import math
-
-# from bt_connect import IMUSensorData as IMUData
 import pandas as pd
+from matplotlib.animation import FuncAnimation
 
-# 设置中文字体（SimHei 是黑体，Linux 可用 Noto Sans CJK）
-rcParams['font.sans-serif'] = ['SimHei']  # 或者 ['Microsoft YaHei']
-rcParams['axes.unicode_minus'] = False     # 解决负号 '-' 显示成方块的问题
+rcParams['font.sans-serif'] = ['SimHei']
+rcParams['axes.unicode_minus'] = False
 
 @dataclass
 class IMUData:
-    """IMU传感器数据结构"""
-    accelerometer: np.ndarray  # 3D加速度 (m/s^2)
-    gyroscope: np.ndarray      # 3D角速度 (rad/s)
-    quaternion: np.ndarray     # 四元数 (w, x, y, z)
+    accelerometer: np.ndarray
+    gyroscope: np.ndarray
+    quaternion: np.ndarray  # (w, x, y, z)
 
 @dataclass
 class EncoderData:
-    """编码器数据结构"""
-    angle: float  # 膝关节角度 (度)
+    angle: float  # degrees
 
 @dataclass
 class DHParameter:
-    """DH参数"""
-    a: float      # 连杆长度
-    alpha: float  # 连杆扭角
-    d: float      # 连杆偏距
-    theta: float  # 关节角度
+    a: float
+    alpha: float
+    d: float
+    theta: float  # radians
 
 class LowerLimbKinematicsDH:
-    """基于DH参数的下肢运动学模型"""
-    
+    """基于DH参数的下肢运动学模型（支持初始姿态锁定与相对旋转）"""
     def __init__(self, thigh_length=0.45, shank_length=0.43, hip_width=0.2):
-        """
-        初始化运动学模型
-        
-        参数:
-            thigh_length: 大腿长度 (米)
-            shank_length: 小腿长度 (米)
-            hip_width: 髋关节宽度 (米)
-        """
         self.thigh_length = thigh_length
         self.shank_length = shank_length
         self.hip_width = hip_width
-        
-        # 存储历史数据
+
+        # 初始姿态（以 rotation 矩阵形式存储）
+        self.init_rotations = {}  # keys: 'pelvis','left_thigh','right_thigh'
+        self.initialized = False
+
+        # 内部用于保持角度连续性的历史（弧度）
+        self._left_hip_rad_hist: List[float] = []
+        self._right_hip_rad_hist: List[float] = []
+
+        # 对外暴露的历史（度, 位置等）
         self.history = {
             'time': [],
-            'left_hip_angle': [],
-            'right_hip_angle': [],
-            'left_knee_angle': [],
-            'right_knee_angle': [],
-            'left_joint_positions': [],
-            'right_joint_positions': [],
-            'dh_params': {
-                'left': [],
-                'right': []
-            }
+            'left_hip_angle': [],    # 度
+            'right_hip_angle': [],   # 度
+            'left_knee_angle': [],   # 度
+            'right_knee_angle': [],  # 度
+            'left_joint_positions': [],   # List of lists of 3D points
+            'right_joint_positions': []
         }
-        
+
+    # -------------------- 基础数学 / DH --------------------
+    def quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
+        # 输入 q = [w, x, y, z] -> scipy expects [x,y,z,w]
+        return R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+
     def dh_transform(self, dh: DHParameter) -> np.ndarray:
-        """
-        根据DH参数计算变换矩阵
-        
-        DH变换矩阵 = Rot_z(theta) * Trans_z(d) * Trans_x(a) * Rot_x(alpha)
-        
-        参数:
-            dh: DH参数
-        返回:
-            4x4齐次变换矩阵
-        """
-        ct = np.cos(dh.theta)
-        st = np.sin(dh.theta)
-        ca = np.cos(dh.alpha)
-        sa = np.sin(dh.alpha)
-        
+        ct = np.cos(dh.theta); st = np.sin(dh.theta)
+        ca = np.cos(dh.alpha); sa = np.sin(dh.alpha)
         T = np.array([
             [ct, -st*ca,  st*sa, dh.a*ct],
             [st,  ct*ca, -ct*sa, dh.a*st],
-            [0,   sa,     ca,    dh.d],
-            [0,   0,      0,     1]
+            [0,     sa,     ca,    dh.d],
+            [0,     0,      0,     1]
         ])
-        
         return T
-    
-    def quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
-        """将四元数转换为旋转矩阵"""
-        return R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
-    
-    def get_leg_dh_params(self, hip_angle: float, knee_angle: float, side: str) -> List[DHParameter]:
-        """
-        获取单腿的DH参数链
-        
-        坐标系定义（改进的DH约定）:
-        - 基座（骨盆）-> 髋关节 -> 膝关节 -> 踝关节
-        
-        参数:
-            hip_angle: 髋关节角度（弧度）- 屈曲为正
-            knee_angle: 膝关节角度（弧度）- 弯曲为正
-            side: 'left' 或 'right'
-        返回:
-            DH参数列表
-        """
-        # 髋关节偏移方向
-        hip_offset = self.hip_width / 2 if side == 'left' else -self.hip_width / 2
-        
-        dh_params = [
-            # 关节0: 骨盆到髋关节（平移）
-            DHParameter(
-                a=0,           # 无连杆长度
-                alpha=0,       # 无扭转
-                d=hip_offset,  # 髋关节横向偏移
-                theta=0       # 无旋转
-            ),
-            # 关节1: 髋关节（矢状面屈曲/伸展）
-            DHParameter(
-                a=0,              # 无横向偏移
-                alpha=0,   
-                d=0,              # 无纵向偏移
-                theta=hip_angle   # 髋关节角度
-            ),
-            # 关节2: 大腿段
-            DHParameter(
-                a=self.thigh_length,  # 大腿长度
-                alpha=0,              # 平行
-                d=0,
-                theta=0
-            ),
-            # 关节3: 膝关节
-            DHParameter(
-                a=0,
-                alpha=0,
-                d=0,
-                theta=knee_angle  # 膝关节角度
-            ),
-            # 关节4: 小腿段
-            DHParameter(
-                a=self.shank_length,  # 小腿长度
-                alpha=0,
-                d=0,
-                theta=0
-            )
-        ]
-        
-        return dh_params
-    
-    def forward_kinematics_dh(self, pelvis_pose: np.ndarray, 
-                              dh_params: List[DHParameter]) -> List[np.ndarray]:
-        """
-        使用DH参数进行前向运动学计算
-        
-        参数:
-            pelvis_pose: 4x4骨盆位姿矩阵
-            dh_params: DH参数列表
-        返回:
-            关节位置列表（包括所有中间关节）
-        """
+
+    def forward_kinematics_dh(self, pelvis_pose: np.ndarray, dh_params: List[DHParameter]) -> List[np.ndarray]:
         T = pelvis_pose.copy()
-        joint_positions = [T[:3, 3]]  # 起始位置（骨盆）
-        
+        joint_positions = [T[:3, 3].copy()]  # 骨盆位置
         for dh in dh_params:
             T = T @ self.dh_transform(dh)
             joint_positions.append(T[:3, 3].copy())
-        
         return joint_positions
-    
-    def calculate_hip_angle_from_imu(self, pelvis_imu: IMUData, 
-                                     thigh_imu: IMUData) -> float:
+
+    def get_leg_dh_params(self, hip_angle: float, knee_angle: float, side: str) -> List[DHParameter]:
+        hip_offset = self.hip_width / 2.0 if side == 'left' else -self.hip_width / 2.0
+        return [
+            # pelvis -> hip lateral offset
+            DHParameter(a=0.0, alpha=0.0, d=hip_offset, theta=0.0),
+            # hip flexion/extension (sagittal plane)
+            DHParameter(a=0.0, alpha=0.0, d=0.0, theta=hip_angle),
+            # thigh link
+            DHParameter(a=self.thigh_length, alpha=0.0, d=0.0, theta=0.0),
+            # knee
+            DHParameter(a=0.0, alpha=0.0, d=0.0, theta=knee_angle),
+            # shank
+            DHParameter(a=self.shank_length, alpha=0.0, d=0.0, theta=0.0)
+        ]
+
+    # -------------------- 初始姿态与相对旋转 --------------------
+    def lock_initial_rotation_if_needed(self, imu_name: str, q_current: np.ndarray):
+        """第一次时锁定IMU初始旋转矩阵作为基准R_init"""
+        if imu_name not in self.init_rotations:
+            self.init_rotations[imu_name] = self.quaternion_to_rotation_matrix(q_current)
+
+    def relative_rotation(self, imu_name: str, q_current: np.ndarray) -> np.ndarray:
+        """返回相对于该IMU初始姿态的旋转矩阵 R_rel = R_init^T * R_current"""
+        if imu_name not in self.init_rotations:
+            # 如果尚未初始化，先锁定
+            self.lock_initial_rotation_if_needed(imu_name, q_current)
+        R_init = self.init_rotations[imu_name]
+        R_curr = self.quaternion_to_rotation_matrix(q_current)
+        return R_init.T @ R_curr
+
+    # -------------------- 连续性处理，避免180°跳变 --------------------
+    def _ensure_continuous_angle(self, angle_rad: float, hist: List[float]) -> float:
+        """利用历史角度保证角度连续性（将 angle_rad 调整到与 hist[-1] 最近的等价值）"""
+        if not hist:
+            return angle_rad
+        prev = hist[-1]
+        # 将 angle_rad 移入 prev +/- pi 区间范围
+        # 通过添加或减去 2*pi 来消除跳变
+        while angle_rad - prev > np.pi:
+            angle_rad -= 2 * np.pi
+        while angle_rad - prev < -np.pi:
+            angle_rad += 2 * np.pi
+        return angle_rad
+
+    # -------------------- 关键: 用IMU计算髋关节角 --------------------
+    def calculate_hip_angle_from_relative_rot(self, R_pelvis: np.ndarray, R_thigh: np.ndarray) -> float:
         """
-        从IMU数据计算髋关节角度
-        
-        参数:
-            pelvis_imu: 骨盆IMU数据
-            thigh_imu: 大腿IMU数据
-        返回:
-            髋关节角度（弧度）
+        计算髋关节屈曲角度（绕局部Y轴或近似绕前后轴）。
+        我们使用相对旋转矩阵 R_rel = R_pelvis^T * R_thigh，然后从其中提取屈曲分量。
+        返回值：弧度（未经连续性处理）
         """
-        R_pelvis = self.quaternion_to_rotation_matrix(pelvis_imu.quaternion)
-        R_thigh = self.quaternion_to_rotation_matrix(thigh_imu.quaternion)
-        
-        # 计算相对旋转
-        R_relative = R_pelvis.T @ R_thigh
-        
-        # 提取屈曲角度（绕Y轴）
-        hip_angle = np.arctan2(R_relative[0, 2], R_relative[2, 2])
-        
-        return hip_angle
-    
+        R_rel = R_pelvis.T @ R_thigh
+        # 常见方法取绕Y轴 (屈伸)：
+        # angle = atan2(R_rel[0,2], R_rel[2,2])
+        angle = np.arctan2(R_rel[0, 2], R_rel[2, 2])
+        return angle
+
+    # -------------------- 主更新函数 --------------------
     def update(self, timestamp: float,
                pelvis_imu: IMUData,
                left_thigh_imu: IMUData,
@@ -201,420 +146,277 @@ class LowerLimbKinematicsDH:
                right_knee_encoder: EncoderData,
                pelvis_position: np.ndarray = None):
         """
-        更新运动学模型状态
-        
-        参数:
-            timestamp: 时间戳
-            pelvis_imu: 骨盆IMU数据
-            left_thigh_imu: 左大腿IMU数据
-            right_thigh_imu: 右大腿IMU数据
-            left_knee_encoder: 左膝编码器数据
-            right_knee_encoder: 右膝编码器数据
-            pelvis_position: 骨盆位置（可选）
+        更新模型（逐帧调用）
+        - 第一次会锁定每个IMU的初始旋转（基准）
+        - 后续使用相对旋转计算角度
         """
         if pelvis_position is None:
             pelvis_position = np.array([0.0, 0.0, 0.0])
-        
-        R_pelvis = self.quaternion_to_rotation_matrix(pelvis_imu.quaternion)
+
+        # 锁定初始旋转（如果尚未锁定）
+        self.lock_initial_rotation_if_needed('pelvis', pelvis_imu.quaternion)
+        self.lock_initial_rotation_if_needed('left_thigh', left_thigh_imu.quaternion)
+        self.lock_initial_rotation_if_needed('right_thigh', right_thigh_imu.quaternion)
+        if not self.initialized:
+            # 第一次调用时把初始骨盆姿态设为“竖直向下”参考（仅告知）
+            self.initialized = True
+            print("✅ 已锁定初始IMU基准姿态（作为 '竖直向下' 起始参考）。")
+
+        # 计算相对于初始的旋转矩阵
+        R_pelvis_rel = self.relative_rotation('pelvis', pelvis_imu.quaternion)
+        R_left_rel = self.relative_rotation('left_thigh', left_thigh_imu.quaternion)
+        R_right_rel = self.relative_rotation('right_thigh', right_thigh_imu.quaternion)
+
+        # 从相对旋转中计算髋角（弧度）
+        left_hip_rad = self.calculate_hip_angle_from_relative_rot(R_pelvis_rel, R_left_rel)
+        right_hip_rad = self.calculate_hip_angle_from_relative_rot(R_pelvis_rel, R_right_rel)
+
+        # 连续性修正（避免 180° 翻转）
+        left_hip_rad = self._ensure_continuous_angle(left_hip_rad, self._left_hip_rad_hist)
+        right_hip_rad = self._ensure_continuous_angle(right_hip_rad, self._right_hip_rad_hist)
+
+        # 保存连续性历史（弧度）
+        self._left_hip_rad_hist.append(left_hip_rad)
+        self._right_hip_rad_hist.append(right_hip_rad)
+
+        # 膝角直接由编码器（度 -> 弧度）
+        left_knee_rad = math.radians(left_knee_encoder.angle)
+        right_knee_rad = math.radians(right_knee_encoder.angle)
+
+        # 为 DH 前向运动学构造骨盆位姿（将 R_pelvis_rel 用作骨盆朝向）
+        # 如果你要把初始定义为“竖直向下”，这里可以再乘以一个固定的旋转矩阵进行对齐，
+        # 示例中我们把初始姿态基准的相对旋转直接作为骨盆朝向（在 init 阶段，R_pelvis_rel = I）
         pelvis_pose = np.eye(4)
-        pelvis_pose[:3, :3] = R_pelvis
+        # 可选：把坐标轴变换为 Z 向下的世界（示例加了一个对齐变换）
+        align_to_z_down = np.array([
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, -1, 0]
+        ])
+        pelvis_pose[:3, :3] = R_pelvis_rel @ align_to_z_down
         pelvis_pose[:3, 3] = pelvis_position
-        
-        # 计算髋关节角度
-        left_hip_angle = self.calculate_hip_angle_from_imu(pelvis_imu, left_thigh_imu)
-        right_hip_angle = self.calculate_hip_angle_from_imu(pelvis_imu, right_thigh_imu)
-        
-        # 转换膝关节角度为弧度
-        left_knee_angle = np.radians(left_knee_encoder.angle)
-        right_knee_angle = np.radians(right_knee_encoder.angle)
-        
-        # 获取DH参数
-        left_dh = self.get_leg_dh_params(left_hip_angle, left_knee_angle, 'left')
-        right_dh = self.get_leg_dh_params(right_hip_angle, right_knee_angle, 'right')
-        
-        # 前向运动学
+
+        # DH 前向
+        left_dh = self.get_leg_dh_params(left_hip_rad, left_knee_rad, 'left')
+        right_dh = self.get_leg_dh_params(right_hip_rad, right_knee_rad, 'right')
         left_positions = self.forward_kinematics_dh(pelvis_pose, left_dh)
         right_positions = self.forward_kinematics_dh(pelvis_pose, right_dh)
-        
-        # 存储历史数据
+
+        # 存历史（对外以度表示角度）
         self.history['time'].append(timestamp)
-        self.history['left_hip_angle'].append(np.degrees(left_hip_angle))
-        self.history['right_hip_angle'].append(np.degrees(right_hip_angle))
+        self.history['left_hip_angle'].append(math.degrees(left_hip_rad))
+        self.history['right_hip_angle'].append(math.degrees(right_hip_rad))
         self.history['left_knee_angle'].append(left_knee_encoder.angle)
         self.history['right_knee_angle'].append(right_knee_encoder.angle)
         self.history['left_joint_positions'].append(left_positions)
         self.history['right_joint_positions'].append(right_positions)
-        self.history['dh_params'] = {
-            'left': left_dh,
-            'right': right_dh
-        }
 
         return {
-            'left_hip_angle': np.degrees(left_hip_angle),
-            'right_hip_angle': np.degrees(right_hip_angle),
+            'left_hip_angle': math.degrees(left_hip_rad),
+            'right_hip_angle': math.degrees(right_hip_rad),
             'left_knee_angle': left_knee_encoder.angle,
             'right_knee_angle': right_knee_encoder.angle,
             'left_positions': left_positions,
             'right_positions': right_positions
         }
-    
-    def plot_skeleton_3d(self, frame_idx=-1):
-        """
-        绘制3D骨架图
-        
-        参数:
-            frame_idx: 要显示的帧索引（-1表示最后一帧）
-        """
+
+    # -------------------- 绘图与动画 --------------------
+    def plot_joint_angles(self):
         if len(self.history['time']) == 0:
             print("没有数据可以绘制")
             return
-        
-        fig = plt.figure(figsize=(12, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # 获取指定帧的数据
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+        t = self.history['time']
+        axes[0].plot(t, self.history['left_hip_angle'], label='左髋')
+        axes[0].plot(t, self.history['right_hip_angle'], label='右髋')
+        axes[0].set_ylabel('髋角 (度)')
+        axes[0].legend(); axes[0].grid(True); axes[0].axhline(0, color='k', linestyle='--', alpha=0.3)
+        axes[1].plot(t, self.history['left_knee_angle'], label='左膝')
+        axes[1].plot(t, self.history['right_knee_angle'], label='右膝')
+        axes[1].set_ylabel('膝角 (度)'); axes[1].set_xlabel('时间 (s)')
+        axes[1].legend(); axes[1].grid(True); axes[1].axhline(0, color='k', linestyle='--', alpha=0.3)
+        plt.tight_layout(); plt.show()
+
+    def plot_skeleton_3d(self, frame_idx=-1):
+        if len(self.history['time']) == 0:
+            print("没有数据")
+            return
         left_pos = self.history['left_joint_positions'][frame_idx]
         right_pos = self.history['right_joint_positions'][frame_idx]
-        
-        # 提取关节位置
-        # 左腿: 骨盆 -> 髋 -> 大腿中点 -> 膝 -> 小腿中点 -> 踝
-        left_x = [p[0] for p in left_pos]
-        left_y = [p[1] for p in left_pos]
-        left_z = [p[2] for p in left_pos]
-        
-        # 右腿
-        right_x = [p[0] for p in right_pos]
-        right_y = [p[1] for p in right_pos]
-        right_z = [p[2] for p in right_pos]
-        
-        # 绘制骨架
-        ax.plot(left_x, left_y, left_z, 'b-o', linewidth=3, markersize=8, label='左腿')
-        ax.plot(right_x, right_y, right_z, 'r-o', linewidth=3, markersize=8, label='右腿')
-        
-        # 绘制骨盆连线
-        ax.plot([left_x[0], right_x[0]], 
-                [left_y[0], right_y[0]], 
-                [left_z[0], right_z[0]], 'g-', linewidth=4, label='骨盆')
-        
-        # 标注关节
-        joints = ['骨盆', '髋', '大腿', '膝', '小腿', '踝']
-        for i, joint in enumerate(joints):
-            if i < len(left_pos):
-                ax.text(left_x[i], left_y[i], left_z[i], f'L-{joint}', fontsize=8)
-            if i < len(right_pos):
-                ax.text(right_x[i], right_y[i], right_z[i], f'R-{joint}', fontsize=8)
-        
-        # 设置坐标轴
-        ax.set_xlabel('X (米)', fontsize=12)
-        ax.set_ylabel('Y (米)', fontsize=12)
-        ax.set_zlabel('Z (米)', fontsize=12)
-        ax.set_zlim(max)
-        ax.set_title(f'下肢骨架 (DH参数法) - 时间: {self.history["time"][frame_idx]:.2f}s', 
-                     fontsize=14)
+        fig = plt.figure(figsize=(10, 8)); ax = fig.add_subplot(111, projection='3d')
+        lx = [p[0] for p in left_pos]; ly = [p[1] for p in left_pos]; lz = [p[2] for p in left_pos]
+        rx = [p[0] for p in right_pos]; ry = [p[1] for p in right_pos]; rz = [p[2] for p in right_pos]
+        ax.plot(lx, ly, lz, '-o', label='左腿'); ax.plot(rx, ry, rz, '-o', label='右腿')
+        ax.plot([lx[0], rx[0]],[ly[0], ry[0]],[lz[0], rz[0]], '-g', linewidth=3, label='骨盆')
+        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
+        ax.invert_zaxis()  # 让 Z 轴向下
+        ax.legend(); ax.grid(True)
+        plt.title(f'骨架 (帧 {frame_idx})'); plt.show()
 
-        # 设置相同的刻度范围
-        all_x = left_x + right_x
-        all_y = left_y + right_y
-        all_z = left_z + right_z
-        
-        max_range = max(max(all_x)-min(all_x), 
-                       max(all_y)-min(all_y), 
-                       max(all_z)-min(all_z)) / 2.0
-        
-        mid_x = (max(all_x) + min(all_x)) * 0.5
-        mid_y = (max(all_y) + min(all_y)) * 0.5
-        mid_z = (max(all_z) + min(all_z)) * 0.5
-        
-        ax.set_xlim(mid_x - max_range, mid_x + max_range)
-        ax.set_ylim(mid_y - max_range, mid_y + max_range)
-        ax.set_zlim(mid_z - max_range, mid_z + max_range)
-        
-        ax.grid(True)
-        plt.show()
-    
-    def animate_skeleton(self, interval=50, repeat=True, save_path=None):
+    def animate_skeleton(self, interval: int = 20, repeat=True, save_path: str = None):
         """
-        播放3D骨架动画
-        
-        参数:
-            interval: 帧间隔时间（毫秒）
-            repeat: 是否循环播放
-            save_path: 保存动画的路径（可选，如 'gait_animation.gif'）
+        播放动画
+        - interval: 毫秒 (务必为正整数)
         """
-        from matplotlib.animation import FuncAnimation
-        
         if len(self.history['time']) == 0:
             print("没有数据可以播放")
-            return
-        
-        fig = plt.figure(figsize=(14, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # 计算全局坐标范围（所有帧）
+            return None
+
+        if interval <= 0:
+            interval = 20
+
+        # 计算全局范围
         all_positions = []
-        for left_pos, right_pos in zip(self.history['left_joint_positions'], 
-                                       self.history['right_joint_positions']):
-            all_positions.extend(left_pos)
-            all_positions.extend(right_pos)
-        
-        all_x = [p[0] for p in all_positions]
-        all_y = [p[1] for p in all_positions]
-        all_z = [p[2] for p in all_positions]
-        
-        max_range = max(max(all_x)-min(all_x), 
-                       max(all_y)-min(all_y), 
-                       max(all_z)-min(all_z)) / 2.0
-        
+        for L, Rr in zip(self.history['left_joint_positions'], self.history['right_joint_positions']):
+            all_positions.extend(L); all_positions.extend(Rr)
+        all_x = [p[0] for p in all_positions]; all_y = [p[1] for p in all_positions]; all_z = [p[2] for p in all_positions]
+        max_range = max(max(all_x)-min(all_x), max(all_y)-min(all_y), max(all_z)-min(all_z)) / 2.0
         mid_x = (max(all_x) + min(all_x)) * 0.5
         mid_y = (max(all_y) + min(all_y)) * 0.5
         mid_z = (max(all_z) + min(all_z)) * 0.5
-        
-        # 初始化绘图元素
-        left_line, = ax.plot([], [], [], 'b-o', linewidth=3, markersize=8, label='左腿')
-        right_line, = ax.plot([], [], [], 'r-o', linewidth=3, markersize=8, label='右腿')
-        pelvis_line, = ax.plot([], [], [], 'g-', linewidth=4, label='骨盆')
-        
-        # 关节标注文本
-        joint_texts = []
-        joints = ['骨盆', '髋', '大腿', '膝', '小腿', '踝']
-        for _ in range(len(joints) * 2):  # 左右腿各有这些关节
-            text = ax.text(0, 0, 0, '', fontsize=8)
-            joint_texts.append(text)
-        
-        time_text = ax.text2D(0.02, 0.95, '', transform=ax.transAxes, fontsize=12)
-        
-        # 设置固定的坐标轴范围和标签
+
+        fig = plt.figure(figsize=(14, 10)); ax = fig.add_subplot(111, projection='3d')
+        left_line, = ax.plot([], [], [], '-o', linewidth=3, markersize=6, label='左腿')
+        right_line, = ax.plot([], [], [], '-o', linewidth=3, markersize=6, label='右腿')
+        pelvis_line, = ax.plot([], [], [], '-g', linewidth=4, label='骨盆')
+        joints = ['骨盆','髋','大腿','膝','小腿','踝']
+        joint_texts = [ax.text(0,0,0,'', fontsize=8) for _ in range(len(joints)*2)]
+        time_text = ax.text2D(0.02, 0.95, '', transform=ax.transAxes)
+
         ax.set_xlim(mid_x - max_range, mid_x + max_range)
         ax.set_ylim(mid_y - max_range, mid_y + max_range)
         ax.set_zlim(mid_z - max_range, mid_z + max_range)
-        ax.set_xlabel('X (米)', fontsize=12)
-        ax.set_ylabel('Y (米)', fontsize=12)
-        ax.set_zlabel('Z (米)', fontsize=12)
-        ax.set_title('下肢步态动画 (DH参数法)', fontsize=14)
-        ax.legend()
-        ax.grid(True)
-        
+        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)'); ax.set_zlabel('Z (m)')
+        ax.invert_zaxis()
+        ax.grid(True); ax.legend(); ax.set_title('下肢步态动画')
+
         def init():
-            """初始化动画"""
-            left_line.set_data([], [])
-            left_line.set_3d_properties([])
-            right_line.set_data([], [])
-            right_line.set_3d_properties([])
-            pelvis_line.set_data([], [])
-            pelvis_line.set_3d_properties([])
+            left_line.set_data([], []); left_line.set_3d_properties([])
+            right_line.set_data([], []); right_line.set_3d_properties([])
+            pelvis_line.set_data([], []); pelvis_line.set_3d_properties([])
             time_text.set_text('')
-            for text in joint_texts:
-                text.set_text('')
+            for t in joint_texts: t.set_text('')
             return [left_line, right_line, pelvis_line, time_text] + joint_texts
-        
-        def update(frame):
-            """更新每一帧"""
-            # 获取当前帧的数据
-            left_pos = self.history['left_joint_positions'][frame]
-            right_pos = self.history['right_joint_positions'][frame]
-            
-            # 提取坐标
-            left_x = [p[0] for p in left_pos]
-            left_y = [p[1] for p in left_pos]
-            left_z = [p[2] for p in left_pos]
-            
-            right_x = [p[0] for p in right_pos]
-            right_y = [p[1] for p in right_pos]
-            right_z = [p[2] for p in right_pos]
-            
-            # 更新线条
-            left_line.set_data(left_x, left_y)
-            left_line.set_3d_properties(left_z)
-            
-            right_line.set_data(right_x, right_y)
-            right_line.set_3d_properties(right_z)
-            
-            pelvis_line.set_data([left_x[0], right_x[0]], [left_y[0], right_y[0]])
-            pelvis_line.set_3d_properties([left_z[0], right_z[0]])
-            
-            # 更新时间文本
-            time_text.set_text(f'时间: {self.history["time"][frame]:.2f}s | 帧: {frame}/{len(self.history["time"])-1}')
-            
-            # 更新关节标注
-            text_idx = 0
-            for i, joint in enumerate(joints):
-                if i < len(left_pos):
-                    joint_texts[text_idx].set_position((left_x[i], left_y[i]))
-                    joint_texts[text_idx].set_3d_properties(left_z[i])
-                    joint_texts[text_idx].set_text(f'L-{joint}')
-                    text_idx += 1
-                if i < len(right_pos):
-                    joint_texts[text_idx].set_position((right_x[i], right_y[i]))
-                    joint_texts[text_idx].set_3d_properties(right_z[i])
-                    joint_texts[text_idx].set_text(f'R-{joint}')
-                    text_idx += 1
-            
+
+        def update(frame_idx):
+            L = self.history['left_joint_positions'][frame_idx]
+            Rr = self.history['right_joint_positions'][frame_idx]
+            lx = [p[0] for p in L]; ly = [p[1] for p in L]; lz = [p[2] for p in L]
+            rx = [p[0] for p in Rr]; ry = [p[1] for p in Rr]; rz = [p[2] for p in Rr]
+            left_line.set_data(lx, ly); left_line.set_3d_properties(lz)
+            right_line.set_data(rx, ry); right_line.set_3d_properties(rz)
+            pelvis_line.set_data([lx[0], rx[0]], [ly[0], ry[0]]); pelvis_line.set_3d_properties([lz[0], rz[0]])
+            time_text.set_text(f'时间: {self.history["time"][frame_idx]:.2f}s  帧: {frame_idx}/{len(self.history["time"])-1}')
+            # joint labels
+            ti = 0
+            for i, name in enumerate(joints):
+                if i < len(L):
+                    joint_texts[ti].set_position((lx[i], ly[i])); joint_texts[ti].set_3d_properties(lz[i])
+                    joint_texts[ti].set_text(f'L-{name}'); ti += 1
+                if i < len(Rr):
+                    joint_texts[ti].set_position((rx[i], ry[i])); joint_texts[ti].set_3d_properties(rz[i])
+                    joint_texts[ti].set_text(f'R-{name}'); ti += 1
             return [left_line, right_line, pelvis_line, time_text] + joint_texts
-        
-        # 创建动画
-        num_frames = len(self.history['time'])
-        anim = FuncAnimation(fig, update, frames=num_frames, 
-                           init_func=init, blit=False,
-                           interval=interval, repeat=repeat)
-        
-        # 保存动画（如果指定了路径）
+
+        anim = FuncAnimation(fig, update, frames=len(self.history['time']), init_func=init,
+                             interval=interval, blit=False, repeat=repeat)
+
         if save_path:
-            print(f"正在保存动画到 {save_path}...")
-            anim.save(save_path, writer='pillow', fps=1000//interval)
-            print("动画保存完成！")
-        
+            try:
+                print(f"正在保存动画到 {save_path} ...")
+                anim.save(save_path, writer='pillow', fps=int(1000/interval))
+                print("保存完成。")
+            except Exception as e:
+                print("保存动画失败:", e)
+
         plt.show()
         return anim
-    
-    def plot_joint_angles(self):
-        """绘制关节角度随时间变化的图表"""
-        if len(self.history['time']) == 0:
-            print("没有数据可以绘制")
-            return
-        
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-        time = self.history['time']
-        
-        # 髋关节角度
-        axes[0].plot(time, self.history['left_hip_angle'], 'b-', label='左髋', linewidth=2)
-        axes[0].plot(time, self.history['right_hip_angle'], 'r-', label='右髋', linewidth=2)
-        axes[0].set_ylabel('髋关节角度 (度)', fontsize=12)
-        axes[0].set_title('关节角度 (DH参数法)', fontsize=14)
-        axes[0].legend()
-        axes[0].grid(True)
-        axes[0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
-        
-        # 膝关节角度
-        axes[1].plot(time, self.history['left_knee_angle'], 'b-', label='左膝', linewidth=2)
-        axes[1].plot(time, self.history['right_knee_angle'], 'r-', label='右膝', linewidth=2)
-        axes[1].set_xlabel('时间 (秒)', fontsize=12)
-        axes[1].set_ylabel('膝关节角度 (度)', fontsize=12)
-        axes[1].legend()
-        axes[1].grid(True)
-        axes[1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
-        
-        plt.tight_layout()
-        plt.show()
-    
-    def print_dh_table(self, hip_angle: float, knee_angle: float, side: str):
-        """
-        打印DH参数表
-        
-        参数:
-            hip_angle: 髋关节角度（度）
-            knee_angle: 膝关节角度（度）
-            side: 'left' 或 'right'
-        """
-        dh_params = self.get_leg_dh_params(np.radians(hip_angle), 
-                                           np.radians(knee_angle), side)
-        
-        print(f"\n{side.upper()}腿DH参数表:")
-        print("-" * 70)
-        print(f"{'关节':<12} {'a (m)':<12} {'α (rad)':<12} {'d (m)':<12} {'θ (rad)':<12}")
-        print("-" * 70)
-        
-        joint_names = ['骨盆-髋', '髋关节', '大腿', '膝关节', '小腿']
-        for i, (name, dh) in enumerate(zip(joint_names, dh_params)):
-            print(f"{name:<12} {dh.a:<12.4f} {dh.alpha:<12.4f} "
-                  f"{dh.d:<12.4f} {dh.theta:<12.4f}")
-        print("-" * 70)
 
-def extract_imu(df, suffix, imu_name):
-    if suffix:
-        imu_cols = ['System_Time'] + [col for col in df.columns if col.endswith(suffix)]
-        imu_df = df[imu_cols].copy()
-        # 去掉后缀
-        imu_df.columns = ['System_Time'] + [col.replace(suffix, '') for col in imu_df.columns[1:]] 
-    else:
-        # 没有后缀的 IMU
-        imu_cols = ['System_Time'] + [col for col in df.columns if not any(col.endswith(s) for s in ['_x', '_y'])]
-        imu_df = df[imu_cols].copy()
+# -------------------- 辅助函数: 从 CSV 提取 IMU/Encoder --------------------
+def extract_imu(df: pd.DataFrame, suffix: str, imu_name: str) -> pd.DataFrame:
+    # 尝试选取带 suffix 的列 (例如 "Acc_X_1", "Quat_W_1" 等)
+    imu_cols = ['System_Time'] + [col for col in df.columns if col.endswith(suffix)]
+    imu_df = df[imu_cols].copy()
+    imu_df.columns = ['System_Time'] + [col.replace(suffix, '') for col in imu_df.columns[1:]]
     imu_df['IMU'] = imu_name
     return imu_df
 
-def extract_enc(df,suffix,joint_name):
-    if suffix:
-        enc_cols = [col for col in df.columns if col.endswith(suffix)]
-        enc_df = df[enc_cols].copy()
-        enc_df.columns = [col.replace(suffix, '') for col in enc_df.columns] 
-
+def extract_enc(df: pd.DataFrame, suffix: str, joint_name: str, flag: bool = True) -> pd.DataFrame:
+    enc_cols = [col for col in df.columns if col.endswith(suffix)]
+    enc_df = df[enc_cols].copy()
+    enc_df.columns = [col.replace(suffix, '') for col in enc_df.columns]
+    if not flag:
+        enc_df = -enc_df
     enc_df['joint'] = joint_name
     return enc_df
 
-def df2encode(enc_row):
-    angle = math.degrees(enc_row['ret0'])
-    return EncoderData(angle=angle)
+def df2encode(enc_row: pd.Series) -> EncoderData:
+    # 假设编码器原始值是弧度 ret0
+    angle_deg = math.degrees(enc_row['ret0'])
+    return EncoderData(angle=angle_deg)
 
-def df2imuData(imu_row):
-    """将 DataFrame 行转换为 IMUData 对象"""
-    accelerometer = np.array([imu_row['Acc_X'], imu_row['Acc_Y'], imu_row['Acc_Z']])
-    gyroscope = np.array([imu_row['Gyro_X'], imu_row['Gyro_Y'], imu_row['Gyro_Z']])
-    quaternion = np.array([imu_row['Quat_W'], imu_row['Quat_X'], imu_row['Quat_Y'], imu_row['Quat_Z']])
-    return IMUData(accelerometer=accelerometer, gyroscope=gyroscope, quaternion=quaternion)
+def df2imuData(imu_row: pd.Series) -> IMUData:
+    acc = np.array([imu_row.get('Acc_X', 0.0), imu_row.get('Acc_Y', 0.0), imu_row.get('Acc_Z', 0.0)])
+    gyro = np.array([imu_row.get('Gyro_X', 0.0), imu_row.get('Gyro_Y', 0.0), imu_row.get('Gyro_Z', 0.0)])
+    quat = np.array([imu_row.get('Quat_W', 1.0), imu_row.get('Quat_X', 0.0), imu_row.get('Quat_Y', 0.0), imu_row.get('Quat_Z', 0.0)])
+    return IMUData(accelerometer=acc, gyroscope=gyro, quaternion=quat)
 
-# 使用示例
+# -------------------- 可运行示例主函数 --------------------
 if __name__ == "__main__":
-    # 创建运动学模型实例
+    # ===== 修改这里的路径到你的 CSV =====
+    DATA_PATH = r'F://3.biye//1_code//imurecv//data//merged//merged_20251106_183706.csv'
+    # ===================================
+    try:
+        df = pd.read_csv(DATA_PATH)
+    except Exception as e:
+        print("无法读取 CSV，请确认路径。错误：", e)
+        raise
+
+    # 创建模型
     model = LowerLimbKinematicsDH(thigh_length=0.50, shank_length=0.49, hip_width=0.37)
-    
-    print("=" * 70)
-    print("基于DH参数的下肢运动学模型")
-    print("=" * 70)
-    
-    # 打印初始DH参数表
-    model.print_dh_table(hip_angle=40, knee_angle=45, side='left')
-    df = pd.read_csv('F://3.biye//1_code//imurecv//data//merged//merged_20251106_183256.csv')  # 假设有一个包含IMU和编码器数据的CSV文件
-    # 提取三个 IMU
-    imu = [None, None, None]
-    imu[0] = extract_imu(df, '_1', 'IMU1')
-    imu[1] = extract_imu(df, '_3', 'IMU2')
-    imu[2] = extract_imu(df, '_2', 'IMU3')
 
-    joint = [None, None]
-    joint[0] = extract_enc(df,'_joint1','joint1')
-    joint[1] = extract_enc(df,'_joint2','joint2')
-    t = 0
-    fs = 200
-    # 遍历每一行数据，更新模型
-    for index, row in df.iterrows():
-        # 提取IMU数据
-        pelvis_imu = df2imuData(imu[0].iloc[index])
-        left_thigh_imu = df2imuData(imu[1].iloc[index])
-        right_thigh_imu = df2imuData(imu[2].iloc[index])
-        t += 1/fs
-        # 模拟IMU数据
-        left_knee_encoder = df2encode(joint[0].iloc[index])
-        right_knee_encoder = df2encode(joint[1].iloc[index])
-        # 更新模型
-        model.update(
-            timestamp=t,
-            pelvis_imu=pelvis_imu,
-            left_thigh_imu=left_thigh_imu,
-            right_thigh_imu=right_thigh_imu,
-            left_knee_encoder=left_knee_encoder,
-            right_knee_encoder=right_knee_encoder
-        )
+    # 根据你原始文件的列后缀来提取 IMU/encoder（示例里使用 _1, _3, _2 等后缀）
+    imu0 = extract_imu(df, '_1', 'IMU_pelvis')
+    imu1 = extract_imu(df, '_3', 'IMU_left_thigh')
+    imu2 = extract_imu(df, '_2', 'IMU_right_thigh')
 
-    
-    print("\n生成可视化图表...")
-    
-    # # 绘制关节角度
+    enc0 = extract_enc(df, '_joint1', 'joint1', flag=True)
+    enc1 = extract_enc(df, '_joint2', 'joint2', flag=False)
+
+    # 检查长度一致性，取最短的那一个作为帧数
+    n = min(len(df), len(imu0), len(imu1), len(imu2), len(enc0), len(enc1))
+    print(f"读取 {n} 帧数据，采样率假设 fs = 200Hz（如不同请修改代码）")
+
+    fs = 200.0
+    t = 0.0
+    for i in range(n):
+        try:
+            pelvis_imu = df2imuData(imu0.iloc[i])
+            left_thigh_imu = df2imuData(imu1.iloc[i])
+            right_thigh_imu = df2imuData(imu2.iloc[i])
+            left_enc = df2encode(enc0.iloc[i])
+            right_enc = df2encode(enc1.iloc[i])
+        except Exception as e:
+            print("行解析错误, 跳过帧:", i, e)
+            continue
+
+        t += 1.0/fs
+        model.update(timestamp=t,
+                     pelvis_imu=pelvis_imu,
+                     left_thigh_imu=left_thigh_imu,
+                     right_thigh_imu=right_thigh_imu,
+                     left_knee_encoder=left_enc,
+                     right_knee_encoder=right_enc)
+
+    print("数据更新完成，开始绘图与动画...")
+    # 关节角度曲线
     model.plot_joint_angles()
-    
-    # # 播放3D骨架动画
-    print("\n播放步态动画...")
-    print("提示: 关闭窗口可继续显示静态图")
-    
-    # # 动画播放（每帧50ms，循环播放）
-    model.animate_skeleton(interval=0.0, repeat=True)
-    
-    # 可选：保存为GIF动画（取消注释下面这行）
-    # model.animate_skeleton(interval=50, repeat=True, save_path='gait_animation.gif')
-    
-    # # 绘制几个关键帧的静态图
-    # print("\n显示关键帧...")
-    # num_frames = len(model.history['time'])
-    # frame_indices = [0, num_frames//2, -1]
-    
-    # for idx in frame_indices:
-    #     model.plot_skeleton_3d(frame_idx=idx)
+
+    # 播放动画（每帧 interval 毫秒）
+    # 如果动画还是存在翻转问题，请尝试增加 interval（减慢速度）或检查 CSV 的四元数连贯性
+    model.animate_skeleton(interval=0.0, repeat=True, save_path=None)
+
+    # 有需要的话也可以显示几个关键帧静态图
+    # model.plot_skeleton_3d(frame_idx=0)
+    # model.plot_skeleton_3d(frame_idx=len(model.history['time'])//2)
+    # model.plot_skeleton_3d(frame_idx=-1)
