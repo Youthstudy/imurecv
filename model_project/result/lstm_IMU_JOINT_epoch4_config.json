@@ -1,0 +1,20 @@
+{
+    "BATCH_SIZE": 64,
+    "CSV_PATH": "model_project\\data\\all_features_with_gait_phase.csv",
+    "EPOCHS": 5,
+    "FUTURE": 5,
+    "LR": 0.001,
+    "MODEL_SAVE_PATH": "model_project/result",
+    "MODEL_TYPE": "lstm",
+    "OUTPUT_COLS": [
+        "gait_phase",
+        "left_knee_angle",
+        "right_knee_angle"
+    ],
+    "USE_DH": false,
+    "USE_FK": false,
+    "USE_IMU": true,
+    "USE_JOINT": true,
+    "USE_OTHER": false,
+    "WINDOW": 50
+}

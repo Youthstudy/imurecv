@@ -1,12 +1,12 @@
 # kinematic_model_build_fixed.py
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from scipy.signal import butter, filtfilt
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from dataclasses import dataclass
 from typing import List
 from matplotlib import rcParams
-import math
 import pandas as pd
 from matplotlib.animation import FuncAnimation
 
@@ -22,6 +22,8 @@ class IMUData:
 @dataclass
 class EncoderData:
     angle: float  # degrees
+    velocity: float = 0.0  # optional
+    t_ff: float = 0.0  # optional
 
 @dataclass
 class DHParameter:
@@ -48,13 +50,15 @@ class LowerLimbKinematicsDH:
         # 对外暴露的历史（度, 位置等）
         self.history = {
             'time': [],
-            'left_hip_angle': [],    # 度
-            'right_hip_angle': [],   # 度
-            'left_knee_angle': [],   # 度
-            'right_knee_angle': [],  # 度
+            'left_hip_angle': [],    # 弧度
+            'right_hip_angle': [],   # 弧度
+            'left_knee_angle': [],   # 弧度
+            'right_knee_angle': [],  # 弧度
             'left_joint_positions': [],   # List of lists of 3D points
-            'right_joint_positions': []
+            'right_joint_positions': [],
+            'dh_params': []  # List of dicts for DH parameters
         }
+        self.feature_history = []
 
     # -------------------- 基础数学 / DH --------------------
     def quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
@@ -179,9 +183,8 @@ class LowerLimbKinematicsDH:
         self._left_hip_rad_hist.append(left_hip_rad)
         self._right_hip_rad_hist.append(right_hip_rad)
 
-        # 膝角直接由编码器（度 -> 弧度）
-        left_knee_rad = math.radians(left_knee_encoder.angle)
-        right_knee_rad = math.radians(right_knee_encoder.angle)
+        left_knee_rad = left_knee_encoder.angle
+        right_knee_rad = right_knee_encoder.angle
 
         # 为 DH 前向运动学构造骨盆位姿（将 R_pelvis_rel 用作骨盆朝向）
         # 如果你要把初始定义为“竖直向下”，这里可以再乘以一个固定的旋转矩阵进行对齐，
@@ -195,25 +198,83 @@ class LowerLimbKinematicsDH:
         ])
         pelvis_pose[:3, :3] = R_pelvis_rel @ align_to_z_down
         pelvis_pose[:3, 3] = pelvis_position
-
+        
         # DH 前向
         left_dh = self.get_leg_dh_params(left_hip_rad, left_knee_rad, 'left')
         right_dh = self.get_leg_dh_params(right_hip_rad, right_knee_rad, 'right')
         left_positions = self.forward_kinematics_dh(pelvis_pose, left_dh)
         right_positions = self.forward_kinematics_dh(pelvis_pose, right_dh)
+        # ------ 保存DH参数（横向） ------
+        feature = {"time": timestamp}
+        def fill_imu(prefix: str, imu: IMUData):
+            feature[f'{prefix}_acc_x'] = imu.accelerometer[0]
+            feature[f'{prefix}_acc_y'] = imu.accelerometer[1]
+            feature[f'{prefix}_acc_z'] = imu.accelerometer[2]
+            feature[f'{prefix}_gyro_x'] = imu.gyroscope[0]
+            feature[f'{prefix}_gyro_y'] = imu.gyroscope[1]
+            feature[f'{prefix}_gyro_z'] = imu.gyroscope[2]
+            feature[f'{prefix}_quat_w'] = imu.quaternion[0]
+            feature[f'{prefix}_quat_x'] = imu.quaternion[1]
+            feature[f'{prefix}_quat_y'] = imu.quaternion[2]
+            feature[f'{prefix}_quat_z'] = imu.quaternion[3]
 
-        # 存历史（对外以度表示角度）
+        fill_imu('pelvis', pelvis_imu)
+        fill_imu('left_thigh', left_thigh_imu)
+        fill_imu('right_thigh', right_thigh_imu)
+
+        for i,dh in enumerate(left_dh):
+            prefix = f'L{i}'
+            feature[f'{prefix}_a'] = dh.a
+            feature[f'{prefix}_alpha'] = dh.alpha
+            feature[f'{prefix}_d'] = dh.d
+            feature[f'{prefix}_theta'] = dh.theta
+            feature[f'{prefix}_theta_sin'] = np.sin(dh.theta)
+            feature[f'{prefix}_theta_cos'] = np.cos(dh.theta)
+
+        for i,dh in enumerate(right_dh):
+            prefix = f'R{i}'
+            feature[f'{prefix}_a'] = dh.a
+            feature[f'{prefix}_alpha'] = dh.alpha
+            feature[f'{prefix}_d'] = dh.d
+            feature[f'{prefix}_theta'] = dh.theta
+            feature[f'{prefix}_theta_sin'] = np.sin(dh.theta)
+            feature[f'{prefix}_theta_cos'] = np.cos(dh.theta)
+
+        # =====================
+        # 3) FK 关键点 root-relative
+        # =====================
+        def fill_fk(prefix, pos):
+            feature[f"{prefix}_x"] = pos[0]
+            feature[f"{prefix}_y"] = pos[1]
+            feature[f"{prefix}_z"] = pos[2]
+
+        pelvis_pos = left_positions[0]  # pelvis root
+
+        for j, name in enumerate(["hip","thigh","knee","shank","ankle"]):
+            fill_fk(f"L_{name}", left_positions[j] - pelvis_pos)
+            fill_fk(f"R_{name}", right_positions[j] - pelvis_pos)
+
+        # =====================
+        # 4) 编码器角度
+        # =====================
+        feature["left_knee_angle"] = left_knee_encoder.angle
+        feature["right_knee_angle"] = right_knee_encoder.angle
+
+        # 保存
+        self.feature_history.append(feature)
+
+        # 存历史（对外以弧度表示角度）
         self.history['time'].append(timestamp)
-        self.history['left_hip_angle'].append(math.degrees(left_hip_rad))
-        self.history['right_hip_angle'].append(math.degrees(right_hip_rad))
+        self.history['left_hip_angle'].append(left_hip_rad)
+        self.history['right_hip_angle'].append(right_hip_rad)
         self.history['left_knee_angle'].append(left_knee_encoder.angle)
         self.history['right_knee_angle'].append(right_knee_encoder.angle)
         self.history['left_joint_positions'].append(left_positions)
         self.history['right_joint_positions'].append(right_positions)
 
         return {
-            'left_hip_angle': math.degrees(left_hip_rad),
-            'right_hip_angle': math.degrees(right_hip_rad),
+            'left_hip_angle': left_hip_rad,
+            'right_hip_angle': right_hip_rad,
             'left_knee_angle': left_knee_encoder.angle,
             'right_knee_angle': right_knee_encoder.angle,
             'left_positions': left_positions,
@@ -229,11 +290,11 @@ class LowerLimbKinematicsDH:
         t = self.history['time']
         axes[0].plot(t, self.history['left_hip_angle'], label='左髋')
         axes[0].plot(t, self.history['right_hip_angle'], label='右髋')
-        axes[0].set_ylabel('髋角 (度)')
+        axes[0].set_ylabel('髋角 (弧度)')
         axes[0].legend(); axes[0].grid(True); axes[0].axhline(0, color='k', linestyle='--', alpha=0.3)
         axes[1].plot(t, self.history['left_knee_angle'], label='左膝')
         axes[1].plot(t, self.history['right_knee_angle'], label='右膝')
-        axes[1].set_ylabel('膝角 (度)'); axes[1].set_xlabel('时间 (s)')
+        axes[1].set_ylabel('膝角 (弧度)'); axes[1].set_xlabel('时间 (s)')
         axes[1].legend(); axes[1].grid(True); axes[1].axhline(0, color='k', linestyle='--', alpha=0.3)
         plt.tight_layout(); plt.show()
 
@@ -351,9 +412,11 @@ def extract_enc(df: pd.DataFrame, suffix: str, joint_name: str, flag: bool = Tru
     return enc_df
 
 def df2encode(enc_row: pd.Series) -> EncoderData:
-    # 假设编码器原始值是弧度 ret0
-    angle_deg = math.degrees(enc_row['ret0'])
-    return EncoderData(angle=angle_deg)
+    # 编码器原始值是弧度 ret0
+    angle_deg = enc_row.get('ret0', 0.0)
+    velocity = enc_row.get('ret1', 0.0)
+    t_ff = enc_row.get('ret2', 0.0)
+    return EncoderData(angle=angle_deg, velocity=velocity, t_ff=t_ff)
 
 def df2imuData(imu_row: pd.Series) -> IMUData:
     acc = np.array([imu_row.get('Acc_X', 0.0), imu_row.get('Acc_Y', 0.0), imu_row.get('Acc_Z', 0.0)])
@@ -401,7 +464,7 @@ if __name__ == "__main__":
             continue
 
         t += 1.0/fs
-        model.update(timestamp=t,
+        result = model.update(timestamp=t,
                      pelvis_imu=pelvis_imu,
                      left_thigh_imu=left_thigh_imu,
                      right_thigh_imu=right_thigh_imu,
@@ -414,8 +477,11 @@ if __name__ == "__main__":
 
     # 播放动画（每帧 interval 毫秒）
     # 如果动画还是存在翻转问题，请尝试增加 interval（减慢速度）或检查 CSV 的四元数连贯性
-    model.animate_skeleton(interval=1.0, repeat=True, save_path=None)
+    # model.animate_skeleton(interval=1.0, repeat=True, save_path=None)
 
+    df_feat = pd.DataFrame(model.feature_history)
+    df_feat.to_csv("all_features.csv", index=False, encoding="utf-8")
+    print("已导出 all_features.csv（包含全部物理/运动学输入）。")
     # 有需要的话也可以显示几个关键帧静态图
     # model.plot_skeleton_3d(frame_idx=0)
     # model.plot_skeleton_3d(frame_idx=len(model.history['time'])//2)
