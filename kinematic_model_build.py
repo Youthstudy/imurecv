@@ -414,7 +414,7 @@ if __name__ == "__main__":
 
     # 播放动画（每帧 interval 毫秒）
     # 如果动画还是存在翻转问题，请尝试增加 interval（减慢速度）或检查 CSV 的四元数连贯性
-    model.animate_skeleton(interval=0.0, repeat=True, save_path=None)
+    model.animate_skeleton(interval=1.0, repeat=True, save_path=None)
 
     # 有需要的话也可以显示几个关键帧静态图
     # model.plot_skeleton_3d(frame_idx=0)
