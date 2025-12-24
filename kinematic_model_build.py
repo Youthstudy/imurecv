@@ -204,6 +204,7 @@ class LowerLimbKinematicsDH:
         right_dh = self.get_leg_dh_params(right_hip_rad, right_knee_rad, 'right')
         left_positions = self.forward_kinematics_dh(pelvis_pose, left_dh)
         right_positions = self.forward_kinematics_dh(pelvis_pose, right_dh)
+        
         # ------ 保存DH参数（横向） ------
         feature = {"time": timestamp}
         def fill_imu(prefix: str, imu: IMUData):

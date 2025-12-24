@@ -1,106 +1,188 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from dataclasses import dataclass
+from typing import List, Dict
+from scipy.spatial.transform import Rotation as R
+import pandas as pd
+@dataclass
+class IMUData:
+    accelerometer: np.ndarray
+    gyroscope: np.ndarray
+    quaternion: np.ndarray  # [w, x, y, z]
+@dataclass
+class EncoderData:
+    angle: float  # rad
+    velocity: float = 0.0
+    t_ff: float = 0.0
 
-# ===================== 1️⃣ 可微分DH层 =====================
-class DHLayer(nn.Module):
+@dataclass
+class DHParameter:
+    a: float
+    alpha: float
+    d: float
+    theta: float
+
+
+class LowerLimbKinematicsRealtime:
     """
-    可微分DH运动学层：根据角度预测末端坐标
+    无绘图 / 无动画
+    专用于：IMU + 编码器 → DH + FK → 特征
     """
-    def __init__(self, thigh_length=0.5, shank_length=0.45, hip_width=0.2):
-        super().__init__()
-        self.thigh_length = nn.Parameter(torch.tensor(thigh_length))
-        self.shank_length = nn.Parameter(torch.tensor(shank_length))
+
+    def __init__(self, thigh_length=0.45, shank_length=0.43, hip_width=0.2):
+        self.thigh_length = thigh_length
+        self.shank_length = shank_length
         self.hip_width = hip_width
 
-    def forward(self, hip_angle, knee_angle, side='left'):
-        hip_offset = self.hip_width / 2 if side == 'left' else -self.hip_width / 2
-        x = self.thigh_length * torch.cos(hip_angle) + \
-            self.shank_length * torch.cos(hip_angle + knee_angle)
-        z = -(self.thigh_length * torch.sin(hip_angle) + \
-              self.shank_length * torch.sin(hip_angle + knee_angle))
-        y = torch.ones_like(x) * hip_offset
-        pos = torch.stack([x, y, z], dim=1)
+        self.init_rot = {}
+        self.initialized = False
+
+        self._lh_hist: List[float] = []
+        self._rh_hist: List[float] = []
+
+    # ------------------ 基础数学 ------------------
+    def _quat2R(self, q):
+        return R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+
+    def _dh_T(self, dh: DHParameter):
+        ct, st = np.cos(dh.theta), np.sin(dh.theta)
+        ca, sa = np.cos(dh.alpha), np.sin(dh.alpha)
+        return np.array([
+            [ct, -st*ca,  st*sa, dh.a*ct],
+            [st,  ct*ca, -ct*sa, dh.a*st],
+            [0,     sa,     ca,    dh.d],
+            [0,     0,      0,     1]
+        ])
+
+    def _fk(self, T0, dhs):
+        T = T0.copy()
+        pos = [T[:3, 3].copy()]
+        for dh in dhs:
+            T = T @ self._dh_T(dh)
+            pos.append(T[:3, 3].copy())
         return pos
 
+    # ------------------ 姿态处理 ------------------
+    def _lock_init(self, name, q):
+        if name not in self.init_rot:
+            self.init_rot[name] = self._quat2R(q)
 
-# ===================== 2️⃣ 主姿态估计网络 =====================
-class PoseEstimator(nn.Module):
-    """
-    用IMU/编码器特征预测关节角，并通过DH层输出姿态坐标
-    """
-    def __init__(self, input_dim=8, hidden_dim=128):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-        )
-        self.angle_head = nn.Linear(hidden_dim // 2, 2)  # 输出：hip, knee
-        self.dh_layer = DHLayer()
+    def _R_rel(self, name, q):
+        self._lock_init(name, q)
+        return self.init_rot[name].T @ self._quat2R(q)
 
-    def forward(self, x):
-        feat = self.encoder(x)
-        angles = self.angle_head(feat)
-        hip = angles[:, 0]
-        knee = angles[:, 1]
-        pos = self.dh_layer(hip, knee)
-        return pos, angles
+    def _unwrap(self, a, hist):
+        if not hist:
+            return a
+        while a - hist[-1] > np.pi:
+            a -= 2*np.pi
+        while a - hist[-1] < -np.pi:
+            a += 2*np.pi
+        return a
+
+    def _hip_angle(self, Rp, Rt):
+        Rrel = Rp.T @ Rt
+        return np.arctan2(Rrel[0, 2], Rrel[2, 2])
+
+    # ------------------ DH 构造 ------------------
+    def _leg_dh(self, hip, knee, side):
+        off = self.hip_width/2 if side == "left" else -self.hip_width/2
+        return [
+            DHParameter(0, 0, off, 0),
+            DHParameter(0, 0, 0, hip),
+            DHParameter(self.thigh_length, 0, 0, 0),
+            DHParameter(0, 0, 0, knee),
+            DHParameter(self.shank_length, 0, 0, 0)
+        ]
+    
+    def step(self,
+             pelvis_imu: IMUData,
+             left_thigh_imu: IMUData,
+             right_thigh_imu: IMUData,
+             left_knee: EncoderData,
+             right_knee: EncoderData,
+             timestamp: float = 0.0) -> Dict:
+        """
+        输入一帧传感器数据
+        输出：DH + FK 特征（dict）
+        """
+
+        # 相对旋转
+        Rp = self._R_rel("pelvis", pelvis_imu.quaternion)
+        Rl = self._R_rel("left_thigh", left_thigh_imu.quaternion)
+        Rr = self._R_rel("right_thigh", right_thigh_imu.quaternion)
+
+        # 髋角
+        lh = self._unwrap(self._hip_angle(Rp, Rl), self._lh_hist)
+        rh = self._unwrap(self._hip_angle(Rp, Rr), self._rh_hist)
+        self._lh_hist.append(lh)
+        self._rh_hist.append(rh)
+
+        # DH
+        left_dh = self._leg_dh(lh, left_knee.angle, "left")
+        right_dh = self._leg_dh(rh, right_knee.angle, "right")
+
+        # 骨盆位姿
+        T0 = np.eye(4)
+        T0[:3, :3] = Rp
+        T0[:3, 3] = np.zeros(3)
+
+        Lpos = self._fk(T0, left_dh)
+        Rpos = self._fk(T0, right_dh)
+        root = Lpos[0]
+
+        feat = {}
+
+        # ===== DH 特征 =====
+        for i, dh in enumerate(left_dh):
+            feat[f"L{i}_theta"] = dh.theta
+            feat[f"L{i}_sin"] = np.sin(dh.theta)
+            feat[f"L{i}_cos"] = np.cos(dh.theta)
+
+        for i, dh in enumerate(right_dh):
+            feat[f"R{i}_theta"] = dh.theta
+            feat[f"R{i}_sin"] = np.sin(dh.theta)
+            feat[f"R{i}_cos"] = np.cos(dh.theta)
+
+        # ===== FK 特征（root-relative）=====
+        names = ["hip", "thigh", "knee", "shank", "ankle"]
+        for i, n in enumerate(names):
+            p = Lpos[i] - root
+            feat[f"L_{n}_x"], feat[f"L_{n}_y"], feat[f"L_{n}_z"] = p
+
+            p = Rpos[i] - root
+            feat[f"R_{n}_x"], feat[f"R_{n}_y"], feat[f"R_{n}_z"] = p
+
+        # ===== 关节角 =====
+        feat["left_hip_angle"] = lh
+        feat["right_hip_angle"] = rh
+        feat["left_knee_angle"] = left_knee.angle
+        feat["right_knee_angle"] = right_knee.angle
+        # ===== 记录到 buffer（不影响实时）=====
+        if self.enable_record:
+            feat["time"] = timestamp
+            self.feature_buffer.append(feat)
+
+        return feat
+    
+    def save_csv(self, path: str):
+        """
+        将已缓存的特征保存为 CSV
+        """
+        if not self.feature_buffer:
+            print("⚠️ feature_buffer 为空，未保存 CSV")
+            return
+
+        df = pd.DataFrame(self.feature_buffer)
+        df.to_csv(path, index=False, encoding="utf-8")
+        print(f"✅ 已保存 CSV: {path}")
+
+    def reset(self):
+        """清空历史（用于新实验段）"""
+        self.init_rot.clear()
+        self._lh_hist.clear()
+        self._rh_hist.clear()
+        self.feature_buffer.clear()
 
 
-# ===================== 3️⃣ 数据集包装 =====================
-class PoseDataset(Dataset):
-    """
-    从CSV中读取IMU+编码器数据，并给出真值角度或足端位置
-    """
-    def __init__(self, csv_path):
-        df = pd.read_csv(csv_path)
-        # 示例: 取 IMU 加速度+角速度+编码器角度
-        features = ['Acc_X_1', 'Acc_Y_1', 'Acc_Z_1',
-                    'Gyro_X_1', 'Gyro_Y_1', 'Gyro_Z_1',
-                    'ret0_joint1', 'ret0_joint2', ]
-        labels = ['label']
-        self.X = torch.tensor(df[features].values, dtype=torch.float32)
-        self.Y = torch.tensor(df[labels].values, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
 
 
-# ===================== 4️⃣ 训练逻辑 =====================
-def train_pose_estimator(csv_path, epochs=10, lr=1e-3, batch_size=64):
-    dataset = PoseDataset(csv_path)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    model = PoseEstimator(input_dim=8)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-
-    for epoch in range(epochs):
-        total_loss = 0
-        for X, Y in dataloader:
-            pred_pos, pred_angles = model(X)
-            # 使用末端坐标真值 (Y[:,2:]) 进行监督
-            loss = loss_fn(pred_pos, Y[:, 2:])
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * len(X)
-        print(f"Epoch {epoch+1}/{epochs}, Loss = {total_loss/len(dataset):.6f}")
-
-    torch.save(model.state_dict(), "pose_estimator_dh.pth")
-    print("✅ 训练完成，模型已保存。")
-    return model
-
-
-# ===================== 5️⃣ 测试 =====================
-if __name__ == "__main__":
-    csv_path = r"F:\3.biye\1_code\imurecv\data\merged\merged_20251106_183706.csv"
-    model = train_pose_estimator(csv_path, epochs=20)

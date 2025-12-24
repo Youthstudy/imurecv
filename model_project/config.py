@@ -25,3 +25,4 @@ EPOCHS = 5
 LR = 1e-3
 
 MODEL_SAVE_PATH = "model_project/result"
+MODEL_MODE = "train"  # "train" or "predict"

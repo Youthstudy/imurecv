@@ -10,10 +10,11 @@ from config import *
 
 class FutureDataset(Dataset):
     def __init__(self):
-        df = pd.read_csv(CSV_PATH)
-        self.df = df
+        if(MODEL_MODE == "train"):
+            df = pd.read_csv(CSV_PATH)
+            self.df = df
         # 自动识别列
-        groups = detect_feature_groups(df.columns)
+            groups = detect_feature_groups(df.columns)
 
         # 拼接输入
         self.input_cols = []
