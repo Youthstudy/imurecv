@@ -483,6 +483,7 @@ class SensorUI:
         try:
             if self.inference_thread:
                 self.inference_thread.stop()
+                self.inference_thread = None
             
             self.inference_thread = InferenceThread(
                 config_path=self.json_file_path,
@@ -490,6 +491,24 @@ class SensorUI:
                 device="auto"
             )
             self.inference_thread.set_callback(self._on_prediction_result)
+            
+            # 同步 UI 已有的 cache 数据到推理器（带名称映射）
+            with self._cache_lock:
+                # IMU 数据同步（带名称映射）
+                name_map = {"left": "left_thigh", "right": "right_thigh"}
+                imu_to_sync = {}
+                for dev_id, data in self.cache.get("imu", {}).items():
+                    mapped_id = name_map.get(dev_id, dev_id)
+                    imu_to_sync[mapped_id] = data
+                
+                joint_to_sync = self.cache.get("joint", {}).copy()
+                
+                if imu_to_sync or joint_to_sync:
+                    self.inference_thread.update(imu=imu_to_sync, joint=joint_to_sync)
+                    self.log_panel.log(
+                        f"已同步缓存: IMU={list(imu_to_sync.keys())}, Joint={list(joint_to_sync.keys())}", 
+                        "INFO"
+                    )
             
             info = self.inference_thread.info()
             self.log_panel.log(f"推理器初始化: {info['inferencer']['model_type']}", "SUCCESS")
@@ -515,7 +534,8 @@ class SensorUI:
                 data_str = f"{phase}, {left}, {right}"
                 self.receiver.send_line(data_str)
             except Exception as e:
-                self.logger.error(f"发送推理结果失败: {e}")
+                # self.logger.error(f"发送推理结果失败: {e}")
+                pass
         
         self.root.after(0, self._update_prediction_ui)
     
@@ -533,15 +553,20 @@ class SensorUI:
     def on_imu(self, data:btc.IMUSensorData):
         """IMU数据回调 - 从传感器模块调用"""
         try:
+            # 名称映射（兼容旧命名）
+            device_id = data.device_id
+            name_map = {"left": "left_thigh", "right": "right_thigh"}
+            device_id = name_map.get(device_id, device_id)
             
             imu_data = imu_adp.sensor_to_imu(data)
             
             with self._cache_lock:
-                self.cache["imu"][data.device_id] = imu_data
+                self.cache["imu"][device_id] = imu_data
             
-            if self._is_predicting and self.inference_thread:
-                print(f"Received IMU data from {data.device_id}: {imu_data}")
-                self.inference_thread.update_imu(data.device_id, imu_data)
+            # 只要推理线程存在就更新，不管是否正在推理
+            # 这样推理器的 cache 始终保持最新
+            if self.inference_thread:
+                self.inference_thread.update_imu(device_id, imu_data)
         except Exception as e:
             self.logger.error(f"处理IMU数据失败: {e}")
     
@@ -557,8 +582,8 @@ class SensorUI:
             with self._cache_lock:
                 self.cache["joint"].update(joint_data)
 
-            if self._is_predicting and self.inference_thread:
-                print(f"Received Joint data: {joint_data}")
+            # 只要推理线程存在就更新，不管是否正在推理
+            if self.inference_thread:
                 for joint_id, data in joint_data.items():
                     self.inference_thread.update_joint(joint_id, data)
                     
@@ -585,8 +610,8 @@ class SensorUI:
 
             self.btmanager = btc.MultiIMUManager()
             self.btmanager.add_device("pelvis", "00:04:3E:6C:51:C1")
-            self.btmanager.add_device("right", "00:04:3E:86:27:F0")  # 替换为实际MAC地址
-            self.btmanager.add_device("left", "00:04:3E:86:27:ED") 
+            self.btmanager.add_device("right_thigh", "00:04:3E:86:27:F0")  # 修复：改为 right_thigh
+            self.btmanager.add_device("left_thigh", "00:04:3E:86:27:ED")   # 修复：改为 left_thigh
             self.btmanager.register_callback(self.on_imu)
 
             self.receiver = m2p.SerialReceiver(port = self.port_entry.get(), 
@@ -646,13 +671,14 @@ class SensorUI:
         self.log_panel.log("数据接收已停止", "WARNING")
     
     def start_prediction(self):
-        if not self.inference_thread:
-            if not self._init_inference():
-                return
+        # 每次启动都重新初始化推理器，确保状态干净
+        if not self._init_inference():
+            return
+            
         print("Starting prediction...")
         try:
-            self.inference_thread.start()
             self._is_predicting = True
+            self.inference_thread.start()
             
             self.btn_start_predict.config(state=tk.DISABLED)
             self.btn_stop_predict.config(state=tk.NORMAL)
@@ -661,19 +687,22 @@ class SensorUI:
             self.log_panel.log("步态推理已启动", "SUCCESS")
             
         except Exception as e:
+            self._is_predicting = False
             self.log_panel.log(f"启动推理失败: {e}", "ERROR")
     
     def stop_prediction(self):
+        self._is_predicting = False
+        
         if self.inference_thread:
             stats = self.inference_thread.get_stats()
             self.inference_thread.stop()
+            self.inference_thread = None  # 清除，下次启动重新创建
             
             self.log_panel.log(
                 f"推理统计: 帧数={stats['frame_count']}, FPS={stats['last_fps']:.1f}",
                 "INFO"
             )
         
-        self._is_predicting = False
         self.btn_stop_predict.config(state=tk.DISABLED)
         self.btn_start_predict.config(state=tk.NORMAL)
         
@@ -688,8 +717,8 @@ class SensorUI:
         
         self.log_panel.log("启动模拟数据测试...", "INFO")
         
-        self.inference_thread.start()
         self._is_predicting = True
+        self.inference_thread.start()
         
         self.btn_start_predict.config(state=tk.DISABLED)
         self.btn_stop_predict.config(state=tk.NORMAL)

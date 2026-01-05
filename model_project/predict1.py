@@ -130,8 +130,8 @@ class GaitPredictor:
                 self.cache["imu"]["pelvis"],
                 self.cache["imu"]["left_thigh"],
                 self.cache["imu"]["right_thigh"],
-                self.cache["joint"]["left_knee"].to_kin(),
-                self.cache["joint"]["right_knee"].to_kin()
+                self.cache["joint"]["left_knee"],
+                self.cache["joint"]["right_knee"]
             )
             # 确保 dh 和 fk 键存在
             if result and "dh" not in result:
