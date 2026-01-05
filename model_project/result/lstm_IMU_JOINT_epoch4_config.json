@@ -1,9 +1,10 @@
 {
     "BATCH_SIZE": 64,
-    "CSV_PATH": "model_project\\data\\all_features_with_gait_phase.csv",
+    "CSV_PATH": "model_project\\data\\all_features_gait.csv",
     "EPOCHS": 5,
     "FUTURE": 5,
     "LR": 0.001,
+    "MODEL_MODE": "train",
     "MODEL_SAVE_PATH": "model_project/result",
     "MODEL_TYPE": "lstm",
     "OUTPUT_COLS": [
@@ -16,5 +17,9 @@
     "USE_IMU": true,
     "USE_JOINT": true,
     "USE_OTHER": false,
-    "WINDOW": 50
+    "WINDOW": 50,
+    "MODEL_PATH": "model_project/result\\lstm_IMU_JOINT_epoch4.pth",
+    "VAL_LOSS": 0.04133340175030753,
+    "EPOCH": 4,
+    "SAVE_TIME": "2026-01-04 14:55:12"
 }

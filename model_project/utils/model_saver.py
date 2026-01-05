@@ -32,11 +32,9 @@ class ModelSaver:
         if val_loss is None:
             raise ValueError("val_loss 必须提供用于判断最优模型")
 
-        # 如果不是最优模型，直接返回
         if val_loss >= self.best_val_loss:
             return None
 
-        # 删除旧模型文件
         if self.best_model_path and os.path.exists(self.best_model_path):
             os.remove(self.best_model_path)
         if self.best_config_path and os.path.exists(self.best_config_path):
@@ -44,31 +42,46 @@ class ModelSaver:
 
         self.best_val_loss = val_loss
 
-        # 自动生成模型名
         model_name = self._generate_model_name(config) if config else "model"
         if epoch is not None:
             model_name += f"_epoch{epoch}"
 
-        # 判断模型类型保存
         model_path = os.path.join(self.save_dir, model_name)
-        if hasattr(model, "state_dict"):  # PyTorch 模型
-            model_path += ".pt"
+
+        # 保存模型
+        if hasattr(model, "state_dict"):
+            model_path += ".pth"
             torch.save(model.state_dict(), model_path)
-        else:  # scikit-learn 或其他模型
+        else:
             model_path += ".joblib"
             joblib.dump(model, model_path)
 
         self.best_model_path = model_path
         print(f"Best model saved: {model_path}")
 
-        # 保存 config
-        config_path = None
+        # ===== 保持原 config 格式，仅追加字段 =====
         if config:
-            config_dict = config if isinstance(config, dict) else {k: getattr(config, k) for k in dir(config) if k.isupper()}
-            config_path = os.path.join(self.save_dir, model_name + "_config.json")
-            with open(config_path, "w") as f:
-                json.dump(config_dict, f, indent=4)
-            self.best_config_path = config_path
-            print(f"Config saved: {config_path}")
+            config_dict = (
+                config if isinstance(config, dict)
+                else {k: getattr(config, k) for k in dir(config) if k.isupper()}
+            )
+        else:
+            config_dict = {}
+
+        # 追加“列”
+        config_dict.update({
+            "MODEL_PATH": model_path,
+            "VAL_LOSS": val_loss,
+            "EPOCH": epoch,
+            "SAVE_TIME": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+        json_path = os.path.join(self.save_dir, model_name + "_config.json")
+        with open(json_path, "w") as f:
+            json.dump(config_dict, f, indent=4)
+
+        self.best_config_path = json_path
+        print(f"Config updated: {json_path}")
 
         return model_path
+

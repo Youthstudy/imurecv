@@ -9,7 +9,7 @@ from .feature_detect import detect_feature_groups
 from config import *
 
 class FutureDataset(Dataset):
-    def __init__(self):
+    def __init__(self, normalize=True, eps=1e-6):
         if(MODEL_MODE == "train"):
             df = pd.read_csv(CSV_PATH)
             self.df = df
@@ -25,7 +25,23 @@ class FutureDataset(Dataset):
         if USE_OTHER: self.input_cols += groups["other"]
 
         # 输入矩阵
-        self.X = df[self.input_cols].values.astype(np.float32)
+        X = df[self.input_cols].values.astype(np.float32)
+
+        # ====== 归一化处理 ======
+        self.normalize = normalize
+        self.eps = eps
+
+        if self.normalize:
+            self.mean = X.mean(axis=0)
+            self.std = X.std(axis=0)
+            self.std[self.std < eps] = 1.0   # 防止除 0
+
+            X = (X - self.mean) / self.std
+        else:
+            self.mean = None
+            self.std = None
+
+        self.X = X
 
         # 输出（3 个）
         self.Y = df[OUTPUT_COLS].values.astype(np.float32)

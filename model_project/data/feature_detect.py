@@ -30,7 +30,7 @@ def detect_feature_groups(columns):
             continue
 
         # ---- 4. Joint angles ----
-        if "knee_angle" in name:
+        if "knee_angle" in name or "knee_vel" in name:
             joint.append(c)
             continue
 

@@ -4,6 +4,7 @@
     "EPOCHS": 5,
     "FUTURE": 5,
     "LR": 0.001,
+    "MODEL_MODE": "train",
     "MODEL_SAVE_PATH": "model_project/result",
     "MODEL_TYPE": "svm",
     "OUTPUT_COLS": [
@@ -16,5 +17,9 @@
     "USE_IMU": true,
     "USE_JOINT": true,
     "USE_OTHER": false,
-    "WINDOW": 50
+    "WINDOW": 50,
+    "MODEL_PATH": "model_project/result\\svm_IMU_JOINT_epoch5.joblib",
+    "VAL_LOSS": 0,
+    "EPOCH": 5,
+    "SAVE_TIME": "2025-12-26 11:12:32"
 }
