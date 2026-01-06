@@ -11,9 +11,6 @@ import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, Callable, List
 import copy
-import json
-import pickle
-import torch
 import numpy as np
 from collections import deque
 from dataclasses import dataclass
@@ -21,16 +18,12 @@ from pathlib import Path
 
 
 # ==================== 导入已有模块 ====================
-from model_project.models.model_lstm import LSTMRegressor
-from model_project.models.model_cnn import CNNRegressor
-from model_project.models.model_svm import SVMRegressor
-from model_project.utils.kinematic_model_core import LowerLimbKinematicsDH, EncoderData as KinEncoderData
 import sensorread.imu_adapter as imu_adp
 import sensorread.encoder_adapter as enc_adp
 import sensorread.bt_connect as btc
 import sensorread.MCU2PC as m2p
-from base.data_base import IMUData, EncoderData, DHParameter
-from model_project.predict1 import GaitPredictor, InferenceThread
+from base.data_base import IMUData, EncoderData
+from model_project.predict1 import InferenceThread
 # ==================== 数据结构 ====================
 
 
@@ -400,7 +393,34 @@ class SensorUI:
                 bg=ThemeConfig.BG_SECONDARY, fg=ThemeConfig.TEXT_INFO, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         ttk.Button(json_frame, text="浏览...", width=8, command=self.select_json_file).pack(side=tk.RIGHT)
+
+        # ========== 新增: CSV 保存目录选择 ==========
+        tk.Label(inner, text="CSV保存目录:", font=ThemeConfig.FONT_NORMAL,
+                bg=ThemeConfig.BG_SECONDARY, fg=ThemeConfig.TEXT_PRIMARY).pack(anchor="w", pady=(10, 2))
+        
+        csv_frame = tk.Frame(inner, bg=ThemeConfig.BG_SECONDARY)
+        csv_frame.pack(fill=tk.X)
+        
+        self.csv_dir_path = "./exp"  # 默认当前目录
+        self.csv_dir_var = tk.StringVar(value="./exp")
+        
+        tk.Label(csv_frame, textvariable=self.csv_dir_var, font=ThemeConfig.FONT_SMALL,
+                bg=ThemeConfig.BG_SECONDARY, fg=ThemeConfig.TEXT_SUCCESS, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
     
+        ttk.Button(csv_frame, text="浏览...", width=8, command=self.select_csv_dir).pack(side=tk.RIGHT)
+
+    def select_csv_dir(self):
+        """选择CSV文件保存目录"""
+        dir_path = filedialog.askdirectory(
+            title="选择CSV保存目录",
+            initialdir=self.csv_dir_path
+        )
+        if dir_path:
+            self.csv_dir_path = dir_path
+            self.csv_dir_var.set(dir_path)
+            self.log_panel.log(f"CSV保存目录已设置: {dir_path}", "SUCCESS")
+            self.logger.info(f"CSV保存目录: {dir_path}")
+
     def _build_control_section(self, parent):
         control_frame = SectionFrame(parent, "操作控制")
         control_frame.pack(fill=tk.X)
@@ -595,7 +615,8 @@ class SensorUI:
     def select_json_file(self):
         file_path = filedialog.askopenfilename(
             title="选择推理配置文件",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            initialdir= "./model_project/result"
         )
         if file_path:
             self.json_file_path = file_path
@@ -607,15 +628,17 @@ class SensorUI:
         
         try:
             # TODO: 添加你的实际初始化代码
-
+            # 使用选择的目录拼接文件路径
+            csv_dir = getattr(self, 'csv_dir_path', './')
             self.btmanager = btc.MultiIMUManager()
             self.btmanager.add_device("pelvis", "00:04:3E:6C:51:C1")
             self.btmanager.add_device("right_thigh", "00:04:3E:86:27:F0")  # 修复：改为 right_thigh
             self.btmanager.add_device("left_thigh", "00:04:3E:86:27:ED")   # 修复：改为 left_thigh
+
             self.btmanager.register_callback(self.on_imu)
 
             self.receiver = m2p.SerialReceiver(port = self.port_entry.get(), 
-                                            baudrate=460800, output_csv="./joint.csv")
+                                            baudrate=460800, output_csv="./joint.csv",save_path=csv_dir)
             self.receiver.set_data_callback(self.on_joint)
             
             self._update_status("idle", "模型已初始化")
@@ -656,6 +679,9 @@ class SensorUI:
         self.log_panel.log("开始接收数据", "SUCCESS")
         
         # TODO: 启动实际数据接收
+        csv_dir = getattr(self, 'csv_dir_path', './')
+        self.btmanager.set_all_devices_save_dir(csv_dir)  # 设置保存目录
+        self.receiver.set_save_path(csv_dir)  # 设置保存目录
         self.receiver.start()
         self.btmanager.start_all()
     
@@ -802,7 +828,7 @@ class SensorUI:
 def main():
     root = tk.Tk()
     
-    window_width, window_height = 850, 700
+    window_width, window_height = 900, 800
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     x = (screen_width - window_width) // 2

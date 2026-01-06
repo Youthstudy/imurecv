@@ -1,5 +1,0 @@
-2026-01-05 22:18:26 [INFO] SensorUI: 界面初始化开始
-2026-01-05 22:18:26 [INFO] SensorUI: 界面初始化完成
-2026-01-05 22:18:54 [INFO] SensorUI: 推理器已初始化: {'inferencer': {'model_type': 'lstm', 'device': 'cpu', 'window': '0/50', 'output_cols': ['gait_phase', 'left_knee_angle', 'right_knee_angle']}, 'freq': 1000}
-2026-01-05 22:19:29 [INFO] SensorUI: 正在关闭应用...
-2026-01-05 22:19:29 [INFO] SensorUI: 应用已关闭

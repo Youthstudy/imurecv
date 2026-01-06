@@ -1,0 +1,10 @@
+2026-01-06 14:18:25 [INFO] SensorUI: 界面初始化开始
+2026-01-06 14:18:25 [INFO] SensorUI: 界面初始化完成
+2026-01-06 14:18:35 [INFO] SensorUI: CSV保存目录: F:/3.biye/1_code/imurecv/exp/1
+2026-01-06 14:18:39 [INFO] SensorUI: 推理器已初始化: {'inferencer': {'model_type': 'lstm', 'device': 'cpu', 'window': '0/50', 'output_cols': ['gait_phase', 'left_knee_angle', 'right_knee_angle']}, 'freq': 1000}
+2026-01-06 14:18:42 [INFO] SensorUI: 正在关闭应用...
+2026-01-06 14:18:43 [INFO] SensorUI: 应用已关闭
+2026-01-06 14:18:59 [INFO] SensorUI: 界面初始化开始
+2026-01-06 14:18:59 [INFO] SensorUI: 界面初始化完成
+2026-01-06 14:19:04 [INFO] SensorUI: 正在关闭应用...
+2026-01-06 14:19:04 [INFO] SensorUI: 应用已关闭

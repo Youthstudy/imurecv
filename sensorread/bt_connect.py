@@ -60,7 +60,8 @@ class IMUDevice:
     def __init__(self, device_id: str, mac_address: str, 
                  data_callback: Optional[Callable[[IMUSensorData], None]] = None,
                  error_callback: Optional[Callable[[str, str], None]] = None,
-                 csv_file_path: Optional[str] = "./imu.csv"):
+                 csv_file_path: Optional[str] = None,
+                 csv_save_dir: Optional[str] = None):
         """
         初始化IMU设备
         
@@ -69,6 +70,8 @@ class IMUDevice:
             mac_address: 蓝牙MAC地址
             data_callback: 数据回调函数，接收IMUSensorData对象
             error_callback: 错误回调函数，接收(device_id, error_message)
+            csv_file_path: CSV文件完整路径（优先级高于csv_save_dir）
+            csv_save_dir: CSV保存目录（如果未指定csv_file_path，则在此目录下自动生成文件名）
         """
         self.device_id = device_id
         self.mac_address = mac_address
@@ -83,31 +86,79 @@ class IMUDevice:
         self._connection_lock = threading.Lock()
 
         self.csv_enabled = True  # 是否保存CSV
+        self.csv_save_dir = csv_save_dir  # 保存目录
         self.csv_file_path_base = csv_file_path  # 原始文件路径模板
         self.csv_file_path = None
         self.csv_file = None
         self.csv_writer = None
 
+    def set_csv_save_dir(self, save_dir: str):
+        """
+        设置CSV保存目录
+        
+        Args:
+            save_dir: 保存目录路径
+        """
+        # 确保目录存在
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            print(f"📁 已创建保存目录: {save_dir}")
+        self.csv_save_dir = save_dir
+        print(f"📂 设备 {self.device_id} CSV保存目录设置为: {save_dir}")
+
+    def set_csv_file_path(self, file_path: str):
+        """
+        设置CSV文件完整路径
+        
+        Args:
+            file_path: 完整文件路径
+        """
+        # 确保目录存在
+        dir_path = os.path.dirname(file_path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+            print(f"📁 已创建保存目录: {dir_path}")
+        self.csv_file_path_base = file_path
+        print(f"📄 设备 {self.device_id} CSV文件路径设置为: {file_path}")
+
     def _open_new_csv(self):
         if not self.csv_enabled:
             return
-        self.csv_file_path = self._get_unique_filename(self.csv_file_path_base)
-        self.csv_file = open(self.csv_file_path, mode='w',newline='',encoding='utf-8')
+        
+        # 确定文件路径
+        if self.csv_file_path_base:
+            # 使用指定的文件路径
+            self.csv_file_path = self._get_unique_filename(self.csv_file_path_base)
+        elif self.csv_save_dir:
+            # 使用保存目录 + 自动生成文件名
+            base_name = f"imu_{self.device_id}.csv"
+            full_path = os.path.join(self.csv_save_dir, base_name)
+            self.csv_file_path = self._get_unique_filename(full_path)
+        else:
+            # 默认保存到当前目录
+            self.csv_file_path = self._get_unique_filename("./imu.csv")
+        
+        # 确保目录存在
+        dir_path = os.path.dirname(self.csv_file_path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+        
+        self.csv_file = open(self.csv_file_path, mode='w', newline='', encoding='utf-8')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
-            "System_Time", "Timestamp","device_id",
+            "System_Time", "Timestamp", "device_id",
             "Gyro_X", "Gyro_Y", "Gyro_Z",
             "Acc_X", "Acc_Y", "Acc_Z",
             "Mag_X", "Mag_Y", "Mag_Z",
             "Quat_W", "Quat_X", "Quat_Y", "Quat_Z",
             "Linear_Acc_X", "Linear_Acc_Y", "Linear_Acc_Z"
         ])
-        print(f"🟢 已创建新的 CSV 文件: {os.path.basename(self.csv_file_path)}")
+        print(f"🟢 已创建新的 CSV 文件: {self.csv_file_path}")
 
     def _close_csv(self):
         if self.csv_file:
             self.csv_file.close()
-            print(f"🟡 已关闭 CSV 文件: {os.path.basename(self.csv_file_path)}")
+            print(f"🟡 已关闭 CSV 文件: {self.csv_file_path}")
             self.csv_file = None
             self.csv_writer = None
 
@@ -152,8 +203,7 @@ class IMUDevice:
             daemon=True
         )
         self.receive_thread.start()
-        print(f"✓ 设备 {self.device_id} 开始接收数据")
-
+        print(f"✔ 设备 {self.device_id} 开始接收数据")
 
     def connect(self, port: int = 1, timeout: float = 10.0) -> bool:
         """
@@ -180,7 +230,7 @@ class IMUDevice:
                 self.sock.settimeout(1.0)
                 
                 self.is_connected = True
-                print(f"✓ 设备 {self.device_id} ({self.mac_address}) 连接成功")
+                print(f"✔ 设备 {self.device_id} ({self.mac_address}) 连接成功")
                 return True
                 
             except bluetooth.BluetoothError as e:
@@ -196,13 +246,13 @@ class IMUDevice:
                     self.error_callback(self.device_id, error_msg)
                 return False
     
-    
     def stop_receiving(self):
         """停止数据接收"""
         self.stop_event.set()
         if self.receive_thread:
             self.receive_thread.join(timeout=2)
-        print(f"✓ 设备 {self.device_id} 停止接收数据")
+        self._close_csv()  # 停止时关闭CSV文件
+        print(f"✔ 设备 {self.device_id} 停止接收数据")
     
     def disconnect(self):
         """断开连接"""
@@ -212,7 +262,7 @@ class IMUDevice:
                 try:
                     self.sock.close()
                     self.is_connected = False
-                    print(f"✓ 设备 {self.device_id} 断开连接")
+                    print(f"✔ 设备 {self.device_id} 断开连接")
                 except Exception as e:
                     print(f"✗ 设备 {self.device_id} 断开连接时出错: {e}")
             self.sock = None
@@ -262,7 +312,6 @@ class IMUDevice:
             if self.error_callback:
                 self.error_callback(self.device_id, error_msg)
             return None
-
 
     def _receive_data(self):
         """数据接收线程函数"""
@@ -316,15 +365,67 @@ class IMUDevice:
 
 class MultiIMUManager:
     """多IMU设备管理器"""
-    def __init__(self):
+    def __init__(self, default_save_dir: Optional[str] = None):
         """
         初始化多IMU管理器
+        
+        Args:
+            default_save_dir: 默认CSV保存目录，所有设备的CSV将保存到此目录
         """
         self.devices: Dict[str, IMUDevice] = {}
+        self.default_save_dir = default_save_dir
+        
+        # 如果指定了默认保存目录，确保目录存在
+        if self.default_save_dir and not os.path.exists(self.default_save_dir):
+            os.makedirs(self.default_save_dir)
+            print(f"📁 已创建默认保存目录: {self.default_save_dir}")
 
         self.data_queue = Queue()
         self.external_callbacks: List[Callable[[IMUSensorData], None]] = []
         self.latest_data: Dict[str, IMUSensorData] = {}
+
+    def set_default_save_dir(self, save_dir: str):
+        """
+        设置默认CSV保存目录（对所有新添加的设备生效）
+        
+        Args:
+            save_dir: 保存目录路径
+        """
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            print(f"📁 已创建保存目录: {save_dir}")
+        self.default_save_dir = save_dir
+        print(f"📂 默认CSV保存目录设置为: {save_dir}")
+
+    def set_all_devices_save_dir(self, save_dir: str):
+        """
+        设置所有已添加设备的CSV保存目录
+        
+        Args:
+            save_dir: 保存目录路径
+        """
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            print(f"📁 已创建保存目录: {save_dir}")
+        
+        for device in self.devices.values():
+            device.set_csv_save_dir(save_dir)
+        
+        self.default_save_dir = save_dir
+        print(f"📂 所有设备CSV保存目录已设置为: {save_dir}")
+
+    def set_device_save_path(self, device_id: str, file_path: str):
+        """
+        设置指定设备的CSV文件路径
+        
+        Args:
+            device_id: 设备ID
+            file_path: 完整文件路径
+        """
+        if device_id in self.devices:
+            self.devices[device_id].set_csv_file_path(file_path)
+        else:
+            print(f"✗ 设备 {device_id} 不存在")
 
     def get_latest_data(self, device_id: str) -> Dict[str, Optional[IMUSensorData]]:
         """
@@ -343,26 +444,48 @@ class MultiIMUManager:
             if device_id in connected_ids
         }
     
-    def add_device(self, device_id: str, mac_address: str) -> bool:
-        """添加IMU设备"""
+    def add_device(self, device_id: str, mac_address: str, 
+                   csv_file_path: Optional[str] = None,
+                   csv_save_dir: Optional[str] = None) -> bool:
+        """
+        添加IMU设备
+        
+        Args:
+            device_id: 设备唯一标识符
+            mac_address: 蓝牙MAC地址
+            csv_file_path: 该设备的CSV文件完整路径（可选）
+            csv_save_dir: 该设备的CSV保存目录（可选，如果未指定则使用默认目录）
+        """
         if device_id in self.devices:
             print(f"✗ 设备 {device_id} 已存在")
             return False
+        
+        # 确定保存目录：优先使用传入参数，其次使用默认目录
+        save_dir = csv_save_dir or self.default_save_dir
         
         device = IMUDevice(
             device_id=device_id,
             mac_address=mac_address,
             data_callback=self._on_data,
-            error_callback=self._on_error
+            error_callback=self._on_error,
+            csv_file_path=csv_file_path,
+            csv_save_dir=save_dir
         )
         self.devices[device_id] = device
-        print(f"✓ 添加设备 {device_id} ({mac_address})")
+        print(f"✔ 添加设备 {device_id} ({mac_address})")
+        if save_dir:
+            print(f"  📂 CSV保存目录: {save_dir}")
+        elif csv_file_path:
+            print(f"  📄 CSV文件路径: {csv_file_path}")
         return True
     
     def _on_data(self, data: IMUSensorData):
         """内部数据回调处理"""
         # 放入队列
         self.data_queue.put(data)
+        
+        # 更新最新数据
+        self.latest_data[data.device_id] = data
         
         # 调用外部注册的回调函数
         for callback in self.external_callbacks:
@@ -476,7 +599,9 @@ class MultiIMUManager:
             status[device_id] = {
                 'mac_address': device.mac_address,
                 'is_connected': device.is_connected,
-                'is_receiving': device.receive_thread.is_alive() if device.receive_thread else False
+                'is_receiving': device.receive_thread.is_alive() if device.receive_thread else False,
+                'csv_save_dir': device.csv_save_dir,
+                'csv_file_path': device.csv_file_path
             }
         return status
     
@@ -511,15 +636,25 @@ class MultiIMUManager:
 
 # 使用示例
 if __name__ == "__main__":
-    # 创建管理器
-    manager = MultiIMUManager()
+    # ==================== 方式1: 设置全局保存目录 ====================
+    # 创建管理器时指定默认保存目录
+    manager = MultiIMUManager(default_save_dir="./imu_data")
     
-    # 添加多个IMU设备
+    # 添加多个IMU设备（都会保存到默认目录）
     manager.add_device("IMU_1", "00:04:3E:6C:51:C1")
-    manager.add_device("IMU_2", "00:04:3E:86:27:F0")  # 替换为实际MAC地址
-    manager.add_device("IMU_3", "00:04:3E:86:27:ED")  # 可以添加更多设备
+    manager.add_device("IMU_2", "00:04:3E:86:27:F0")
+    manager.add_device("IMU_3", "00:04:3E:86:27:ED")
     
-    # # 注册自定义回调函数（可选）
+    # ==================== 方式2: 为单个设备指定保存路径 ====================
+    # manager = MultiIMUManager()
+    # manager.add_device("IMU_1", "00:04:3E:6C:51:C1", csv_save_dir="./data/imu1")
+    # manager.add_device("IMU_2", "00:04:3E:86:27:F0", csv_file_path="./data/custom_imu2.csv")
+    
+    # ==================== 方式3: 动态修改保存路径 ====================
+    # manager.set_all_devices_save_dir("./new_save_path")  # 修改所有设备的保存目录
+    # manager.set_device_save_path("IMU_1", "./special/imu1_data.csv")  # 修改单个设备的保存路径
+    
+    # 注册自定义回调函数（可选）
     def my_callback(data: IMUSensorData):
         print(f"[{data.device_id}] Acc: ({data.acc_x:.3f}, {data.acc_y:.3f}, {data.acc_z:.3f})")
     
@@ -533,8 +668,10 @@ if __name__ == "__main__":
     # 打印连接状态
     print("\n设备状态:")
     for device_id, status in manager.get_device_status().items():
-        status_icon = "✓" if status['is_connected'] else "✗"
+        status_icon = "✔" if status['is_connected'] else "✗"
         print(f"  {status_icon} {device_id}: {status['mac_address']} - {'已连接' if status['is_connected'] else '未连接'}")
+        if status['csv_save_dir']:
+            print(f"      📂 保存目录: {status['csv_save_dir']}")
     
     # 只启动成功连接的设备
     connected_devices = manager.get_connected_devices()
@@ -546,12 +683,7 @@ if __name__ == "__main__":
         try:
             print("\n正在接收数据，按Ctrl+C停止...\n")
             while True:
-                # 方式1: 从队列获取数据
                 data = manager.get_data(timeout=1.0)
-                # if data:
-                #     print(f"[队列] {data.device_id}: 时间戳={data.timestamp:.3f}")
-                
-                # 方式2: 数据会自动通过回调函数处理
                 time.sleep(0.01)
                 
         except KeyboardInterrupt:
@@ -562,4 +694,3 @@ if __name__ == "__main__":
             print("程序已退出")
     else:
         print("\n⚠ 没有设备成功连接，程序退出")
-
